@@ -17,8 +17,8 @@ block is a core plus a margin, processed in its own process, keeping what
 its core owns. Memory is bounded by the block size, blocks run in parallel,
 and the results are identical to a whole-model run.
 
-It is also a test bed for three proposed changes to cctbx's `ramalyze`
-and `clashscore` (see the README's Related work).
+It is also a test bed for changes to cctbx's `ramalyze` and reduce2
+proposed in cctbx/cctbx_project#1245 (see the README's Related work).
 
 ### Users
 
@@ -310,10 +310,13 @@ reduce and probe patches. Each tier runs with one command.
 
 ## Related work
 
-- Proposed changes to cctbx_project: `ramalyze` and `clashscore` counting
-  with sets instead of lists (quadratic to linear), and probe's full output
-  for Coot run only on demand. `remolprobity stock` and `compare` check
-  that they change no result (README, Related work).
+- Proposed changes to cctbx_project, in
+  [cctbx/cctbx_project#1245](https://github.com/cctbx/cctbx_project/pull/1245):
+  `ramalyze` counting with sets instead of lists (quadratic to linear), and
+  reduce2's Optimizer linear in the number of Movers, with hydrogens
+  independent of atoms far away. `remolprobity stock` and `compare` check
+  that the ramalyze change changes no result; the self-check pair shows the
+  reduce2 one (README, Related work).
 - Patch to rlabduke/reduce: clique members sorted by (root, index).
 - Patch to probe (repository deprecated): `hisNHcheck` stops at the first
   atom of an earlier residue; carried in the MolProbity image build.

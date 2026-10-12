@@ -455,8 +455,9 @@ Where stock MolProbity itself gets no result, or a different count:
 
 remolprobity uses reduce, probe and clashscore, not series 2 (reduce2,
 probe2, clashscore2). Series 2 needs more memory per atom: reduce2 about
-21 KB and clashscore2 about 53 KB, against about 27 KB for series 1.
-reduce2's result also still depends on order; draft upstream fixes exist.
+22 KB and clashscore2 about 54 KB, against about 27 KB for series 1.
+reduce2's hydrogens also depend on atoms far away; a fix is proposed in
+[cctbx/cctbx_project#1245](https://github.com/cctbx/cctbx_project/pull/1245).
 
 ## Testing
 
@@ -541,16 +542,28 @@ It prints one JSON line.
 
 ## Related work
 
-remolprobity is also a test bed for proposed changes to cctbx's ramalyze
-and clashscore. These count with sets instead of lists, which makes them
-linear rather than quadratic, and run probe's full output for Coot only on
-demand. remolprobity does not need them, because its blocks are small.
+remolprobity is also a test bed for changes to cctbx proposed in
+[cctbx/cctbx_project#1245](https://github.com/cctbx/cctbx_project/pull/1245)
+(issue [#1246](https://github.com/cctbx/cctbx_project/issues/1246)):
 
-The changes should leave every result as it was. To check that on a model,
-run `remolprobity stock` on it with and without them, and
+- **ramalyze** counts with sets instead of lists, which makes it linear
+  rather than quadratic in the number of residues. Its results stay as they
+  were.
+- **reduce2's Optimizer** becomes linear in the number of Movers, and its
+  hydrogens independent of atoms far away.
+
+remolprobity needs neither: its blocks are small, and it uses reduce, not
+reduce2 (see [Engines](#engines)).
+
+To check on a model that the ramalyze change leaves every result as it was,
+run `remolprobity stock` on it with and without the change, and
 `remolprobity compare` the two results (see
 [Stock MolProbity, and comparing results](#stock-molprobity-and-comparing-results)).
-The time and peak memory in the two logs show what the changes save.
+The time and peak memory in the two logs show what it saves. For reduce2,
+the self-check's pair of models (see [Requirements](#requirements)),
+`remolprobity/data/selfcheck_near.pdb` and `selfcheck_far.pdb`, show the
+dependence: with reduce2 on cctbx master, 2 of the sphere's 235 hydrogens differ
+between the two; with the change, none do.
 
 ## License
 
