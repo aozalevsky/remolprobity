@@ -1,0 +1,22 @@
+The patches in this directory change reduce and probe. Like the code they
+change, they are licensed under the Apache License, Version 2.0; see
+LICENSE in this directory. The changes are Copyright (c) 2026 Arthur
+Zalevsky.
+
+reduce-clique-order.patch changes Reduce, whose NOTICE reads:
+
+    Reduce
+    Copyright (c) 1997-2016 J. Michael Word
+    Copyright (c) 1997-2026 David C. Richardson, Jane S. Richardson, and contributors
+
+    This product includes software developed in the Richardson Lab at
+    Duke University (http://kinemage.biochem.duke.edu).
+
+probe-hisNHcheck-quadratic.patch changes Probe:
+
+    probe: Copyright 1996-2016, J. Michael Word; 2021-2023 Richardson Lab
+    (Duke University, http://kinemage.biochem.duke.edu)
+
+probe.c also carries J. Michael Word's original notice, which asks that
+it not be removed or modified and that modified versions be available for
+free. The patch leaves it as it is, and is itself free.

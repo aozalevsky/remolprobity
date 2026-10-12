@@ -1,0 +1,4 @@
+NOTES_internal.md
+__pycache__/
+*.pyc
+.build/

@@ -1,0 +1,216 @@
+[
+ {
+  "name": "2vb1",
+  "source": "rcsb",
+  "id": "2VB1",
+  "properties": [
+   "altlocs"
+  ],
+  "sha256": "484adb8123401a095531460c53db1a68e34fd6c3e4f229deb21fe8c090ee9ce9"
+ },
+ {
+  "name": "1igt",
+  "source": "rcsb",
+  "id": "1IGT",
+  "properties": [
+   "insertion_codes",
+   "ligands"
+  ],
+  "sha256": "d7b1a560ed993c7be669a15530b64f37e2af8e978c321a5779d20ab75746b63f"
+ },
+ {
+  "name": "4hhb",
+  "source": "rcsb",
+  "id": "4HHB",
+  "properties": [
+   "ligands",
+   "metals"
+  ],
+  "sha256": "2d3ca1bf21ddff35af2e2bc5d331720f7bfc46a16c4829ea3ec1b41062d5f5a6"
+ },
+ {
+  "name": "1ehz",
+  "source": "rcsb",
+  "id": "1EHZ",
+  "properties": [
+   "nucleic_residues",
+   "metals"
+  ],
+  "sha256": "3021dd2b6461f850bb66d6748d3c22a5e1bb6cc891c625c15d793f38215b28ab"
+ },
+ {
+  "name": "5pti",
+  "source": "rcsb",
+  "id": "5PTI",
+  "properties": [
+   "disulfides>2"
+  ],
+  "sha256": "d39881b81af60445d9cb7ca59c6b4858a1efd989d5c404e99730c475b26fb55b"
+ },
+ {
+  "name": "1ejg",
+  "source": "rcsb",
+  "id": "1EJG",
+  "properties": [
+   "hydrogens",
+   "altlocs"
+  ],
+  "sha256": "c59b29d7f079064d73667d3b510fdd9d39eb74e04cbd485022bcc9fc2383978d"
+ },
+ {
+  "name": "1ehz_renumbered",
+  "source": "derived",
+  "recipe": [
+   "renumber",
+   "1ehz",
+   "A",
+   10000
+  ],
+  "properties": [
+   "max_resseq>9999"
+  ],
+  "sha256": "dc26266acb03ed58026d0e389912857d0073be388c1742bac8f6018d5feecd67"
+ },
+ {
+  "name": "4hhb_zero_b",
+  "source": "derived",
+  "recipe": [
+   "zero-occupancy",
+   "4hhb",
+   "B"
+  ],
+  "properties": [
+   "zero_occupancy"
+  ],
+  "sha256": "3b238eb691a416dea9713cac416592bcae0f6a6464c5a217b3fe5f66fce335cf"
+ },
+ {
+  "name": "4hhb_pdb",
+  "source": "derived",
+  "recipe": [
+   "as-pdb",
+   "4hhb"
+  ],
+  "properties": [
+   "format=pdb"
+  ],
+  "sha256": "fe2bb65be3bc5f142158164b982eeca9245518cf6246e097e4b1574a9179d63d"
+ },
+ {
+  "name": "9a1l",
+  "source": "rcsb",
+  "id": "9A1L",
+  "properties": [],
+  "sha256": "2a9559b042362f989edcd08427b033a6b83de44a28db16df6a15c6fd74ddcd87",
+  "refused_by_both": {
+   "reason": "an integrative model without occupancy and B ('.'), which iotbx cannot read; IHMValidation writes 0.0 for both before MolProbity sees it",
+   "stock": "At least one PDB file is required as input",
+   "remolprobity": "'.' in _atom_site.occupancy"
+  }
+ },
+ {
+  "name": "9a1n",
+  "source": "rcsb",
+  "id": "9A1N",
+  "properties": [],
+  "sha256": "cc2a4cb83597ebaaf26674cb96417086f11b5d221b1afdd10c2b040a32a5c482",
+  "oracle": false
+ },
+ {
+  "name": "9a1n_100k",
+  "source": "derived",
+  "recipe": [
+   "subset",
+   "9a1n",
+   100000
+  ],
+  "properties": [
+   "long_chain_ids"
+  ],
+  "sha256": "06198ec9e375502395322dac180c10672e46ec65bfc0cf089197a78aded020ef"
+ },
+ {
+  "name": "9a1n_200k",
+  "source": "derived",
+  "recipe": [
+   "subset",
+   "9a1n",
+   200000
+  ],
+  "properties": [
+   "long_chain_ids"
+  ],
+  "sha256": "578c93354d7ee4708d6371802c7f30d54c905d2bdfcc3edacd43bd544c76aace",
+  "retries_at": [
+   "20000/20"
+  ]
+ },
+ {
+  "name": "9a1n_400k",
+  "source": "derived",
+  "recipe": [
+   "subset",
+   "9a1n",
+   400000
+  ],
+  "properties": [
+   "long_chain_ids"
+  ],
+  "sha256": "e54161805920e54fb3a0fd3306c32ce4b4c38cf01c48deabf848437df22d85b2",
+  "retries_at": [
+   "20000/20"
+  ]
+ },
+ {
+  "name": "9a1n_800k",
+  "source": "derived",
+  "recipe": [
+   "subset",
+   "9a1n",
+   800000
+  ],
+  "properties": [],
+  "sha256": "ceae5abba341cd7febd0c3dcf5bc92f476bdb01111e578cb24ec6faf3c9b0475",
+  "tier": "heavy",
+  "oracle": false
+ },
+ {
+  "name": "9a1n_filled",
+  "source": "derived",
+  "recipe": [
+   "subset",
+   "9a1n",
+   1893744
+  ],
+  "properties": [],
+  "sha256": "a74e3666b400d3a3e6c29abbaa06ab22bbb0273be4896e6bb3a1b76a11304fd9",
+  "tier": "perf",
+  "oracle": false
+ },
+ {
+  "name": "9a1n_x2",
+  "source": "derived",
+  "recipe": [
+   "tile",
+   "9a1n",
+   2
+  ],
+  "properties": [],
+  "sha256": "a90105fa9faa9ec4953d136b83b45fc0309f1d17f8465e96af597e16baf8639c",
+  "tier": "perf",
+  "oracle": false
+ },
+ {
+  "name": "9a1n_x4",
+  "source": "derived",
+  "recipe": [
+   "tile",
+   "9a1n",
+   4
+  ],
+  "properties": [],
+  "sha256": "a7c66a92c1ffdf7a42c77837b3cee3e766df0df85d07257fb40cc6564798cd89",
+  "tier": "perf",
+  "oracle": false
+ }
+]

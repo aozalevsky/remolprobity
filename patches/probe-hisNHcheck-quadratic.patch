@@ -1,0 +1,12 @@
+--- a/probe.c
++++ b/probe.c
+@@ -2039,6 +2039,9 @@
+    if (ed->hisNHcount[0]) { /* the zeroth counter flags: Is this a HIS? */
+       /*is a histidine*/
+       for(rat = atomlist; rat; rat = rat->next) {
++	 /* loadAtoms() puts each atom at the head of the list, so this
++	    residue's atoms come first: stop at the first earlier one */
++	 if (rat->r->rescnt < rescnt) { break; }
+ 	 if ((rat->r->rescnt == rescnt) && (rat->props & POSITIVE_PROP)) {
+ 	    char altc = toupper(rat->altConf);
+ 	    int ialt = 0;

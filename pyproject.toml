@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remolprobity"
+version = "0.1.0"
+description = "MolProbity validation of very large models in spatial blocks"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Arthur Zalevsky"}]
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy"]
+
+[project.urls]
+Homepage = "https://github.com/aozalevsky/remolprobity"
+Issues = "https://github.com/aozalevsky/remolprobity/issues"
+
+[tool.setuptools]
+packages = ["remolprobity", "remolprobity.adapters"]
+
+[tool.setuptools.package-data]
+remolprobity = ["data/*.pdb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "container: runs code in the MolProbity image (REMOLPROBITY_IMAGE)",
+    "oracle: compares with stock MolProbity on the corpus",
+    "heavy: hours of compute",
+]
+addopts = "-m 'not oracle and not heavy'"

@@ -1,0 +1,71 @@
+# remolprobity on an existing MolProbity image: reduce with the clique-order
+# patch (a group's result no longer depends on unrelated parts of the
+# model), probe with the hisNHcheck patch (speed), the stock reduce kept at
+# /opt/remolprobity-stock/reduce for the self-check test, and the
+# remolprobity package at /opt/remolprobity on PYTHONPATH. MolProbity itself
+# is not rebuilt: BASE must hold its sources under /opt/molprobity (from
+# bootstrap.py --builder=molprobity), and gcc, g++ and patch on the PATH.
+# The same steps as scripts/dev_image.sh.
+#
+# Build from the repository root (%files paths are relative to it), with
+# TMPDIR on a disk with room for BASE (not a RAM-backed /tmp):
+#   apptainer build --fakeroot --build-arg BASE=/path/to/molprobity.sif remolprobity.sif container/remolprobity.def
+# BASE may also be a sandbox directory.
+#
+# Run (see %help):
+#   apptainer run remolprobity.sif MODEL -o RESULT.json [options]
+#   apptainer run remolprobity.sif stock MODEL -o REFERENCE.json
+#   apptainer run remolprobity.sif compare REFERENCE.json RESULT.json
+Bootstrap: localimage
+From: {{ BASE }}
+
+%files
+    patches/reduce-clique-order.patch /opt/remolprobity-patches/reduce-clique-order.patch
+    patches/probe-hisNHcheck-quadratic.patch /opt/remolprobity-patches/probe-hisNHcheck-quadratic.patch
+    scripts/build_reduce.sh /opt/remolprobity-patches/build_reduce.sh
+    scripts/build_probe.sh /opt/remolprobity-patches/build_probe.sh
+    remolprobity /opt/remolprobity/remolprobity
+
+%post
+    set -e
+    M=/opt/molprobity
+    P=/opt/remolprobity-patches
+    # a BASE already patched (scripts/dev_image.sh) keeps its stock reduce
+    # and its patched sources
+    apply() {
+        if patch -d "$1" -p1 -R --dry-run -s < "$2" >/dev/null 2>&1; then
+            echo "already applied: $2"
+        else
+            patch -d "$1" -p1 < "$2"
+        fi
+    }
+    mkdir -p /opt/remolprobity-stock
+    [ -f /opt/remolprobity-stock/reduce ] || cp -p $M/build/reduce/exe/reduce /opt/remolprobity-stock/reduce
+    apply $M/modules/reduce $P/reduce-clique-order.patch
+    apply $M/modules/probe $P/probe-hisNHcheck-quadratic.patch
+    sh $P/build_reduce.sh $M/modules/reduce $M/build/reduce/exe/reduce
+    sh $P/build_probe.sh $M/modules/probe $M/build/probe/exe/probe
+    find /opt/remolprobity -name __pycache__ -prune -exec rm -rf {} +
+
+%runscript
+    exec mmtbx.python -m remolprobity "$@"
+
+%help
+    remolprobity: MolProbity validation of very large models in spatial blocks.
+
+    apptainer run remolprobity.sif MODEL -o RESULT [options]
+        Validate MODEL (mmCIF or PDB). RESULT: .json, or - for stdout, gives
+        JSON; any other name a pickle. --help lists the options.
+    apptainer run remolprobity.sif stock MODEL -o RESULT
+        Stock MolProbity on the whole model, as a result of the same form
+        (about 20 KB per atom plus 1 GB of memory).
+    apptainer run remolprobity.sif compare A B [--tol T] [--json]
+        Summaries of two results and their differences; exit status 0 if
+        the same.
+
+%environment
+    export PATH=/opt/molprobity/build/bin:${PATH}
+    # a PYTHONPATH given at run time (--env PYTHONPATH=...) replaces this one,
+    # so the checkout it gives is the one imported; add /opt/remolprobity to
+    # it to keep this copy as well
+    export PYTHONPATH=${PYTHONPATH:+$PYTHONPATH:}/opt/remolprobity
