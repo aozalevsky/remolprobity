@@ -112,3 +112,53 @@ def test_rcsb_layout_blocks_are_written(tmp_path):
     m = io.read_model(os.path.join(os.path.dirname(__file__), '..', 'data', '4hhb.cif'))
     plan = blocks.plan_blocks(m, 500, 15.0)
     io.write_blocks(m, plan.members, str(tmp_path))
+
+
+def test_residue_repeated_in_another_chain_object_is_refused(tmp_path):
+    # iotbx keeps them as two residues; remolprobity names residues by chain and number, so it would
+    # merge them into one
+    def atom(i, rec, chain, res, name='CA', comp='ALA'):
+        return '%-6s%5d  %-3s %s %s%4d    %8.3f%8.3f%8.3f  1.00  0.00           C\n' % (
+            rec, i, name, comp, chain, res, 3.8 * i, 0, 0)
+    src = tmp_path / 'm.pdb'
+    src.write_text(atom(1, 'ATOM', 'A', 9) + atom(2, 'ATOM', 'A', 10) + 'TER\n' +
+                   atom(3, 'HETATM', 'A', 10, 'O', 'HOH'))
+    with pytest.raises(io.InputError, match='A 10 .*two chain objects'):
+        io.read_model(str(src))
+
+
+def test_cif_residue_repeated_after_a_label_change_is_refused(tmp_path):
+    src = tmp_path / 'm.cif'
+    src.write_text(cif([('A', 'X', 1, 'ALA'), ('A', 'X', 2, 'ALA'), ('A', 'Y', 2, 'HOH')]))
+    with pytest.raises(io.InputError, match='A 2 .*two chain objects'):
+        io.read_model(str(src))
+
+
+def test_cif_same_group_after_a_label_change_is_one_residue(tmp_path):
+    # merge_atoms_at_end_to_residues, as stock runs it, puts an atom group back into the earlier group of the
+    # same chain, number, name and altloc
+    src = tmp_path / 'm.cif'
+    src.write_text(cif([('A', 'X', 1, 'ALA'), ('A', 'X', 2, 'ALA'), ('A', 'Y', 2, 'ALA')]))
+    m = io.read_model(str(src))
+    assert m.residues == [('A', '1'), ('A', '2')] and list(m.res_of) == [0, 1, 1]
+
+
+def test_residue_split_within_one_chain_object_is_one_residue(tmp_path):
+    def atom(i, res, name):
+        return 'ATOM  %5d  %-3s ALA A%4d    %8.3f%8.3f%8.3f  1.00  0.00           C\n' % (i, name, res, 3.8 * i, 0, 0)
+    src = tmp_path / 'm.pdb'
+    src.write_text(atom(1, 1, 'N') + atom(2, 2, 'N') + atom(3, 1, 'CA'))
+    m = io.read_model(str(src))
+    assert m.residues == [('A', '1'), ('A', '2')] and list(m.res_of) == [0, 1, 0]
+
+
+def test_altloc_group_at_the_end_is_kept_only_if_the_residue_has_it(tmp_path):
+    def atom(i, res, name, alt):
+        return 'ATOM  %5d  %-3s%1sALA A%4d    %8.3f%8.3f%8.3f  0.50  0.00           C\n' % (
+            i, name, alt, res, 3.8 * i, 0, 0)
+    src = tmp_path / 'm.pdb'
+    src.write_text(atom(1, 1, 'CA', 'A') + atom(2, 1, 'CA', 'B') + atom(3, 2, 'CA', '') + atom(4, 1, 'CB', 'B'))
+    assert io.read_model(str(src)).residues == [('A', '1'), ('A', '2')]
+    src.write_text(atom(1, 1, 'CA', 'A') + atom(2, 2, 'CA', '') + atom(3, 1, 'CB', 'B'))
+    with pytest.raises(io.InputError, match="A 1 appears again.*altloc 'B'"):
+        io.read_model(str(src))

@@ -142,20 +142,36 @@ class Model:
 class _Table:
     """Atoms as they are read, into numpy chunks"""
 
-    def __init__(self):
+    def __init__(self, path=''):
+        self.path = path
         self.xyz_chunks, self.res_chunks, self.xyz, self.res = [], [], [], []
         self.index, self.residues, self.resnames, self.ca = {}, [], [], {}
         self.chains, self.names, self.runs = {}, {}, []
         self.occupancy_max, self.zero_occupancy, self.hydrogens = 0.0, 0, 0
+        # atom groups (residue, name, altloc) read so far, and the residue and run of the last atom
+        self.groups, self.last = set(), None
 
-    def add(self, chain, resseq, icode, resname, name, element, xyz, occupancy, run=0):
+    def add(self, chain, resseq, icode, resname, name, element, xyz, occupancy, run=0, altloc=''):
         key = (chain, residue_id(resseq, icode))
         k = self.index.get(key)
+        group = (k, resname.strip(), altloc)
         if k is None:
             k = self.index[key] = len(self.residues)
             self.residues.append(key)
             self.runs.append(run)  # a residue is in the run of its first atom
             self.resnames.append(resname.strip())
+            group = (k,) + group[1:]
+        elif group not in self.groups and self.last != (k, run):
+            # a residue seen before, again after other atoms or in another chain object:
+            # merge_atoms_at_end_to_residues, as stock runs it, puts an atom group back only into an earlier
+            # one of the same name and altloc; any other stays a residue of its own, which remolprobity,
+            # naming residues by chain and number, cannot tell apart
+            raise InputError("%s: residue %s %s appears again, in two chain objects or after other residues, as "
+                             "%s with altloc '%s', which it did not have before; iotbx keeps that as a residue of "
+                             'its own, which remolprobity cannot tell apart; give it a residue number of its own'
+                             % (self.path, chain, key[1], resname.strip(), altloc))
+        self.groups.add(group)
+        self.last = (k, run)
         self.res.append(k)
         self.xyz.append(xyz)
         if name == 'CA' and k not in self.ca:
@@ -214,7 +230,7 @@ def _columns(path, tags):
          'atom': pick('label_atom_id', 'auth_atom_id'),
          'element': pick('type_symbol'),
          'x': pick('Cartn_x'), 'y': pick('Cartn_y'), 'z': pick('Cartn_z'),
-         'occ': pick('occupancy'), 'model': pick('pdbx_PDB_model_num')}
+         'occ': pick('occupancy'), 'model': pick('pdbx_PDB_model_num'), 'alt': pick('label_alt_id')}
     missing = [k for k in ('chain', 'seq', 'comp', 'atom', 'x', 'y', 'z') if c[k] is None]
     if missing:
         raise InputError('%s: atom_site has no %s' % (path, ', '.join(missing)))
@@ -276,7 +292,7 @@ def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=F
         # is with --missing-b-as-zero
         values = [(tags.index(t), t) for t in VALUE_COLUMNS
                   if not (zero_occupancy_as_one and t == 'occupancy' or missing_b_as_zero and t == 'B_iso_or_equiv')]
-    t = _Table()
+    t = _Table(path)
     model = None
     run, prev = -1, None
     ilabel = tags.index('label_asym_id') if 'label_asym_id' in tags else c['chain']
@@ -299,13 +315,14 @@ def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=F
                                       [(tag, r[j]) for j, tag in values if r[j] in ('.', '?')])
         ins = r[c['ins']] if c['ins'] is not None else '?'
         occ = r[c['occ']] if c['occ'] is not None else '?'
+        alt = r[c['alt']] if c['alt'] is not None else '.'
         if prev is None or _starts_chain(chain, r[ilabel], prev[0], prev[1], prev[2]):
             run += 1
         prev = (chain, r[ilabel], r[c['comp']])
         t.add(chain, seq, '' if ins in ('.', '?') else ins, '%3s' % r[c['comp']],
               r[c['atom']], r[c['element']].upper() if c['element'] is not None else '',
               (float(r[c['x']]), float(r[c['y']]), float(r[c['z']])),
-              None if occ in ('.', '?') else float(occ), run)
+              None if occ in ('.', '?') else float(occ), run, '' if alt in ('.', '?') else alt)
     return t.model(path, 'cif', tags)
 
 
@@ -375,7 +392,7 @@ def pdb_number(field):
 
 
 def _read_pdb(path, check=True):
-    t = _Table()
+    t = _Table(path)
     run, chain, ended = 0, None, False
     for line in _pdb_records(path):
         if line.startswith('TER'):
@@ -395,7 +412,7 @@ def _read_pdb(path, check=True):
         name = line[12:16].strip()
         element = line[76:78].strip().upper() or name[:1].upper()
         t.add(line[20:22].strip(), line[22:26], line[26], line[17:20], name, element,
-              (values['x'], values['y'], values['z']), values['occupancy'], run)
+              (values['x'], values['y'], values['z']), values['occupancy'], run, line[16].strip())
     return t.model(path, 'pdb', [])
 
 
