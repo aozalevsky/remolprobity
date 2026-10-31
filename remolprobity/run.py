@@ -61,6 +61,14 @@ def expected_gb(sizes, workers, n_atoms, n_residues):
     return main_gb(n_atoms) + sum(worker_gb(s, n_residues) for s in sorted(sizes, reverse=True)[:workers])
 
 
+def available_cpus():
+    """CPUs this process may run on (its affinity: taskset, cpusets, SLURM), else the machine's"""
+    try:
+        return len(os.sched_getaffinity(0)) or 1
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
 def choose_workers(sizes, n_atoms, n_residues, memory_gb=None, nproc=None, cpus=1):
     """
     Workers for blocks of these sizes (atoms each, core and margin, as
@@ -261,7 +269,7 @@ def _run(a):
     plan = blocks.plan_blocks(model, block_atoms, a.margin)
     sizes = plan.sizes(model)
     nproc, expected = choose_workers(sizes, model.n_atoms, len(model.residues), budget.gb, a.nproc,
-                                     os.cpu_count() or 1)
+                                     available_cpus())
     log('%d atoms, %d residues: %d blocks (%.2fx the model, the largest %d atoms), %d workers, about %.1f GB'
         % (model.n_atoms, len(model.residues), plan.n_blocks, sum(sizes) / model.n_atoms, max(sizes), nproc,
            expected))

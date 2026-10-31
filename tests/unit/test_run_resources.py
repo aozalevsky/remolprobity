@@ -48,3 +48,12 @@ def test_memory_of_zero_or_less_is_refused(tmp_path, capsys):
         assert run.main([str(tmp_path / 'missing.cif'), '-o', str(tmp_path / 'out.pkl'), '--memory', value]) == 1
         err = capsys.readouterr().err
         assert 'error: --memory must be more than 0 GB, not %s' % value in err and 'reading' not in err
+
+
+def test_cpus_are_those_the_process_may_run_on(monkeypatch):
+    # taskset, cpusets and SLURM leave a process fewer CPUs than the machine has
+    monkeypatch.setattr(run.os, 'sched_getaffinity', lambda pid: {0, 3, 5}, raising=False)
+    monkeypatch.setattr(run.os, 'cpu_count', lambda: 64)
+    assert run.available_cpus() == 3
+    monkeypatch.delattr(run.os, 'sched_getaffinity', raising=False)
+    assert run.available_cpus() == 64
