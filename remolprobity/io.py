@@ -130,6 +130,18 @@ class Model:
     hydrogens: int
     # index of the chain object iotbx puts each residue in, reading the whole file
     run_of: np.ndarray = None
+    # the atoms through which cctbx links a polymer residue to the next (C, O3') and to the one before (N, P):
+    # the first of each residue (nan where it has none), and, for residues with more (altlocs), all of them
+    # {residue: (out, in)}
+    link_out: np.ndarray = None
+    link_in: np.ndarray = None
+    link_more: dict = None
+    # whether the residue has a CA (its position is then the CA's), and N, CA, C and O
+    has_ca: np.ndarray = None
+    mainchain: np.ndarray = None
+    # {run: residues}: in each chain object with altlocs, the residues where each altloc first appears
+    # (among all atoms, and among atoms other than hydrogens): iotbx orders a chain's conformers by that
+    introducers: dict = None
 
     @property
     def n_atoms(self):
@@ -137,6 +149,11 @@ class Model:
 
     def atoms_per_residue(self):
         return np.bincount(self.res_of, minlength=len(self.residues))
+
+
+# atom names through which cctbx links polymer residues: 0, to the next residue (peptide C, nucleic O3');
+# 1, to the one before (N, P)
+LINK_SIDE = {'C': 0, "O3'": 0, 'O3*': 0, 'N': 1, 'P': 1}
 
 
 class _Table:
@@ -150,6 +167,10 @@ class _Table:
         self.occupancy_max, self.zero_occupancy, self.hydrogens = 0.0, 0, 0
         # atom groups (residue, name, altloc) read so far, and the residue and run of the last atom
         self.groups, self.last = set(), None
+        self.links = ({}, {})  # {residue: [xyz]} of link atoms out and in
+        self.has_o = set()
+        self.polymer = {}  # resname: whether iotbx links it in a polymer
+        self.first_altloc = ({}, {})  # {run: {altloc: residue}}, among all atoms and among heavy atoms
 
     def add(self, chain, resseq, icode, resname, name, element, xyz, occupancy, run=0, altloc=''):
         key = (chain, residue_id(resseq, icode))
@@ -176,6 +197,19 @@ class _Table:
         self.xyz.append(xyz)
         if name == 'CA' and k not in self.ca:
             self.ca[k] = xyz
+        elif name == 'O':
+            self.has_o.add(k)
+        side = LINK_SIDE.get(name)
+        if side is not None:
+            polymer = self.polymer.get(resname)
+            if polymer is None:
+                polymer = self.polymer[resname] = is_polymer_residue(resname)
+            if polymer:
+                self.links[side].setdefault(k, []).append(xyz)
+        if altloc and run == self.runs[k]:
+            self.first_altloc[0].setdefault(run, {}).setdefault(altloc, k)
+            if element not in ('H', 'D'):
+                self.first_altloc[1].setdefault(run, {}).setdefault(altloc, k)
         self.chains.setdefault(chain, None)
         self.names.setdefault(resname, None)
         if not occupancy:
@@ -205,12 +239,30 @@ class _Table:
         position /= counts[:, None]
         for k, p in self.ca.items():
             position[k] = p
+        has_ca = np.zeros(len(self.residues), dtype=bool)
+        has_ca[list(self.ca)] = True
+        ends = []
+        for side in self.links:
+            a = np.full((len(self.residues), 3), np.nan)
+            for k, points in side.items():
+                a[k] = points[0]
+            ends.append(a)
+        mainchain = has_ca & ~np.isnan(ends[0][:, 0]) & ~np.isnan(ends[1][:, 0])
+        mainchain[[k for k in range(len(self.residues)) if k not in self.has_o]] = False
+        more = {k: (self.links[0].get(k, []), self.links[1].get(k, []))
+                for k in set(self.links[0]) | set(self.links[1])
+                if len(self.links[0].get(k, ())) > 1 or len(self.links[1].get(k, ())) > 1}
+        introducers = {}
+        for found in self.first_altloc:
+            for run, first in found.items():
+                introducers.setdefault(run, set()).update(first.values())
         return Model(path=path, format=fmt, sha256=sha256(path), tags=tags, xyz=xyz,
                      res_of=res_of, residues=self.residues, resnames=self.resnames,
                      position=position, chain_ids=list(self.chains),
                      residue_names=list(self.names), occupancy_max=self.occupancy_max,
                      zero_occupancy=self.zero_occupancy, hydrogens=self.hydrogens,
-                     run_of=np.array(self.runs, dtype=np.int64))
+                     run_of=np.array(self.runs, dtype=np.int64), link_out=ends[0], link_in=ends[1], link_more=more,
+                     has_ca=has_ca, mainchain=mainchain, introducers={run: sorted(ks) for run, ks in introducers.items()})
 
 
 def _columns(path, tags):

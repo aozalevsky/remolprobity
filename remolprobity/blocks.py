@@ -10,6 +10,12 @@ import numpy as np
 
 MIN_MARGIN = 10.0  # Å: sequence neighbours i±2 and linked atoms are within it
 LINK_STEP = 5.0  # Å between linked residues' positions: CA-CA is 3.8 (trans) or 2.9 (cis); farther pairs are not linked (a gap, a ligand or water with the chain's id)
+# Å between a residue's C or O3' and the next one's N or P within which cctbx may link them: its nucleic
+# residue tuples at 3.5, pdb_interpretation at 3 (link_distance_cutoff), protein tuples and CaBLAM at 2,
+# reduce at 1.7
+LINK_ATOMS = 3.5
+# Å between the CAs of residues CaBLAM links when either lacks its main chain (N, CA, C, O): a CA trace
+CA_LINK = 4.5
 
 
 class PlanError(Exception):
@@ -49,11 +55,73 @@ def _split(position, n_atoms, idx, block_atoms):
         _split(position, n_atoms, order[half:], block_atoms)
 
 
+def link_distance(model, a, b):
+    """
+    For residue indices a and b (arrays), the shortest distance from a C or
+    O3' of residue a to an N or P of residue b: where cctbx links a polymer
+    residue to the next; inf where either has none
+    """
+    a, b = np.asarray(a, dtype=np.int64), np.asarray(b, dtype=np.int64)
+    if model.link_out is None or not len(a):
+        return np.full(len(a), np.inf)
+    with np.errstate(invalid='ignore'):
+        d = np.linalg.norm(model.link_out[a] - model.link_in[b], axis=1)
+    d[np.isnan(d)] = np.inf
+    more = model.link_more or {}
+    if more:  # residues with several link atoms (altlocs): the nearest pair
+        keys = np.fromiter(more, dtype=np.int64, count=len(more))
+        for i in np.flatnonzero(np.isin(a, keys) | np.isin(b, keys)):
+            outs = more[int(a[i])][0] if int(a[i]) in more else [model.link_out[a[i]]]
+            ins = more[int(b[i])][1] if int(b[i]) in more else [model.link_in[b[i]]]
+            pairs = [float(np.linalg.norm(np.subtract(p, q))) for p in outs for q in ins]
+            d[i] = min([x for x in pairs if np.isfinite(x)], default=np.inf)
+    return d
+
+
+def could_link(model, a, b):
+    """Whether cctbx may link residue a to residue b (index arrays) were b to follow a in a chain"""
+    near = link_distance(model, a, b) <= LINK_ATOMS
+    if model.has_ca is not None:
+        a, b = np.asarray(a, dtype=np.int64), np.asarray(b, dtype=np.int64)
+        trace = model.has_ca[a] & model.has_ca[b]
+        if model.mainchain is not None:
+            trace &= ~(model.mainchain[a] & model.mainchain[b])
+        near |= trace & (np.linalg.norm(model.position[a] - model.position[b], axis=1) <= CA_LINK)
+    return near
+
+
+def _with_context(model, members):
+    """
+    members (sorted residue indices) with what keeps cctbx's view of their
+    chains as in the whole model: the residues that introduce each altloc
+    of a chain object they are in (iotbx orders conformers by first
+    appearance), and, where two members of one chain object follow each
+    other across residues left out and could link, those residues (else
+    cctbx would join them)
+    """
+    if model.introducers and model.run_of is not None:
+        extra = [model.introducers[r] for r in np.unique(model.run_of[members]) if int(r) in model.introducers]
+        if extra:
+            members = np.union1d(members, np.concatenate([np.asarray(e, dtype=np.int64) for e in extra]))
+    if len(members) < 2:
+        return members
+    a, b = members[:-1], members[1:]
+    same = (model.run_of[a] == model.run_of[b]) if model.run_of is not None else \
+        np.array([model.residues[i][0] == model.residues[j][0] for i, j in zip(a, b)], dtype=bool)
+    gap = np.flatnonzero(same & (b > a + 1))
+    fill = gap[could_link(model, a[gap], b[gap])]
+    if len(fill):
+        members = np.union1d(members, np.concatenate([np.arange(a[i] + 1, b[i]) for i in fill]))
+    return members
+
+
 def block_members(model, owner, block, margin, atom_owner=None):
     """
-    Residue indices of a block: its core (owner[r] == block) and every
-    residue with an atom within margin of the core. atom_owner, the block
-    of each atom (owner[model.res_of]), may be given to save its making
+    Residue indices of a block: its core (owner[r] == block), every residue
+    with an atom within margin of the core, and what keeps their chains as
+    cctbx sees them in the whole model (_with_context). atom_owner, the
+    block of each atom (owner[model.res_of]), may be given to save its
+    making
     """
     from scipy.spatial import cKDTree
 
@@ -66,7 +134,7 @@ def block_members(model, owner, block, margin, atom_owner=None):
     cand = np.flatnonzero(np.all((model.xyz >= lo) & (model.xyz <= hi), axis=1) & ~core)
     d, _ = cKDTree(cxyz).query(model.xyz[cand], distance_upper_bound=margin)
     near = np.unique(model.res_of[cand[np.isfinite(d)]])
-    return np.union1d(idx, near)
+    return _with_context(model, np.union1d(idx, near))
 
 
 def plan_blocks(model, block_atoms, margin):
@@ -98,13 +166,16 @@ def check_neighbours(plan, model, reach=2):
     neighbour is a residue up to reach positions away in file order, reached
     through an unbroken run of linked residues: consecutive residues of one
     chain object (iotbx's, model.run_of; else one chain id) whose positions
-    are at most LINK_STEP apart. Gaps, ligands and
+    are at most LINK_STEP apart, or whose link atoms (C or O3' to N or P)
+    are at most LINK_ATOMS apart, as cctbx may link nucleotides whose
+    centres are farther apart. Gaps, ligands and
     waters that carry the chain's id, and a chain id that reappears after
     another chain, are not linked, so they are not neighbours. Ramachandran
     and the conformation-dependent library need the linked residues i-2..i+2.
     With reach * LINK_STEP <= MIN_MARGIN, every such neighbour of a residue
     placed by its CA is within the margin, so this check guards the margin
-    code and does not refuse a correct plan.
+    code and does not refuse a correct plan; a stretched link may need a
+    larger margin, which the check then asks for.
     """
     nres = len(model.residues)
     if nres < 2:
@@ -115,7 +186,8 @@ def check_neighbours(plan, model, reach=2):
         chain = [c for c, _ in model.residues]
         same = np.fromiter((chain[k] == chain[k + 1] for k in range(nres - 1)), dtype=bool, count=nres - 1)
     step = np.linalg.norm(np.diff(model.position, axis=0), axis=1)
-    linked = same & (step <= LINK_STEP)
+    k = np.arange(nres - 1)
+    linked = same & ((step <= LINK_STEP) | (link_distance(model, k, k + 1) <= LINK_ATOMS))
 
     # need[(sign, d)][r]: residue r has the neighbour r + sign * d
     need = {}
