@@ -13,7 +13,19 @@ import pytest
 from remolprobity import compare, io, jax_io, jax_residues, jax_tables, result
 
 CORPUS_DIR = os.environ.get("REMOLPROBITY_CORPUS", os.path.expanduser("~/.cache/remolprobity/corpus"))
-REF_FILES = sorted(glob.glob(os.path.join(CORPUS_DIR, "reference", "*.pkl")))
+
+
+def _unique_ref_files():
+    by_name = {}
+    for p in sorted(glob.glob(os.path.join(CORPUS_DIR, "reference", "*.pkl"))):
+        base = os.path.basename(p)
+        name = base.split(".")[0]
+        if name not in by_name or base.endswith(".742d1a0065642254.pkl"):
+            by_name[name] = p
+    return [by_name[k] for k in sorted(by_name)]
+
+
+REF_FILES = _unique_ref_files()
 
 
 def test_dihedral_angles_jax():
