@@ -16,13 +16,15 @@ def sample(definitions=('v34', 'v33')):
                            'angles': {'total': 9, 'outliers': []}}
     if 'v33' in definitions:
         geometry['v33'] = {'bonds': {'total': 7, 'outliers': [(A, B, 1.9, 1.5, 20.0)]},
-                           'angles': {'total': 9, 'outliers': [(A, B, A, 100.0, 120.0, 4.5)]}}
+                           'angles': {'total': 9, 'outliers': [(A, B, A, 100.0, 120.0, 4.5)]},
+                           'dihedrals': {'total': 4, 'outliers': []}, 'chiralities': {'total': 1, 'outliers': []},
+                           'planarities': {'total': 2, 'outliers': []}}
     return result.assemble(
         [('A', '1'), ('A', '2'), ('B', '1')], ['GLY', 'SER', 'ALA'],
         [('A', '2', 'SER', '', 'OUTLIER', 60.0, 60.0, 0.01)],
         [('B', '1', 'ALA', 'A', 'OUTLIER', 'OUTLIER', 0.1), ('B', '1', 'ALA', 'B', 'Favored', 'm', 50.0)],
         [(A, B, 0.5, 2.1)], 30, geometry,
-        {('A', '2'): [2, 400.0, 3, 1.0]}, {'remolprobity': '0.1.0', 'reduce': 'r', 'probe': 'p'})
+        {('A', '2'): [2, 400.0, 3, 1.0]}, {'remolprobity': '0.1.0', 'reduce': 'r', 'probe': 'p'}, [], [], [])
 
 
 def test_ihmv34_model_data():

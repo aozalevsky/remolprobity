@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import os
 import pickle
 import sys
@@ -19,7 +20,8 @@ def block(b, owned, rama=(), rota=(), clashes=(), probe_atoms=0, outliers=()):
                    'angles': {'total': 3 * len(owned), 'outliers': []},
                    'residues': {k: [2, 1.0, 3, 2.0] for k in owned}}}
     return {'block': b, 'owned': list(owned), 'ramachandran': list(rama), 'rotamers': list(rota),
-            'clashes': list(clashes), 'probe_atoms': probe_atoms, 'geometry': geo}
+            'cbeta': [], 'omega': [], 'cablam': [], 'cablam_classes': [], 'clashes': list(clashes),
+            'probe_atoms': probe_atoms, 'geometry': geo}
 
 
 class M:
@@ -195,3 +197,100 @@ def test_read_refuses_json_that_is_not_a_result(tmp_path):
     p.write_text('not json')
     with pytest.raises(ValueError, match='not a remolprobity result'):
         result.read(str(p))
+
+
+def test_molprobity_score_as_stock_computes_it():
+    # mmtbx.validation.utils.molprobity_score: clashscore, rotamer outliers and Ramachandran favoured in percent
+    rama = {'total': 200, 'favored': 190, 'allowed': 8, 'outliers': 2}
+    rota = {'total': 150, 'favored': 140, 'allowed': 6, 'outliers': 4}
+    expected = 0.426 * math.log(1 + 12.5) + 0.33 * math.log(1 + (4 / 150 * 100 - 1)) + \
+        0.25 * math.log(1 + (100 - 95.0 - 2)) + 0.5
+    assert result.molprobity_score(12.5, rota, rama) == pytest.approx(expected, rel=1e-12)
+    # no protein: stock's percentages are 0, and the score still a number
+    empty = {'total': 0, 'favored': 0, 'allowed': 0, 'outliers': 0}
+    assert result.molprobity_score(3.0, empty, empty) == pytest.approx(
+        0.426 * math.log(4.0) + 0.25 * math.log(99.0) + 0.5, rel=1e-12)
+
+
+def test_merged_result_has_the_molprobity_score():
+    r = result.merge(M, blocks(), ['v34'], {})
+    assert r['molprobity_score'] == result.molprobity_score(r['clashes']['clashscore'], r['rotamers'],
+                                                            r['ramachandran'])
+
+
+def test_cbeta_counts_every_record_and_keeps_the_outliers():
+    records = [('A', '1', 'SER', '', 0.1, 10.0, 1.0), ('A', '2', 'ALA', 'A', 0.25, -40.0, 0.6),
+               ('A', '2', 'ALA', 'B', 0.3, 20.0, 0.4)]
+    assert result.count_cbeta(records) == {'total': 3, 'outliers': 2}
+    assert result.cbeta_outliers(records) == records[1:]
+
+
+def omega_model(chains, runs, conformer0):
+    class Model:
+        residues = [(c, str(i + 1)) for i, c in enumerate(chains)]
+        resnames = ['ALA'] * len(chains)
+    Model.run_of = runs
+    Model.conformer0 = conformer0
+    return Model
+
+
+def omega(chain, resid, conf, local, kind='Trans', resname='ALA'):
+    """A raw omega record: the peptide before residue resid, from the conformer conf; local: its own atoms' altloc"""
+    return (chain, resid, resname, local, str(int(resid) - 1), local, 179.0, kind, conf, local)
+
+
+def test_omega_keeps_one_copy_of_unaltered_peptides():
+    # one chain object, conformers A and B: a peptide without altlocs comes once, from A
+    m = omega_model(['A'] * 4, [0, 0, 0, 0], {0: 'A'})
+    raw = [omega('A', '2', 'A', ''), omega('A', '3', 'A', 'A'), omega('A', '2', 'B', ''), omega('A', '3', 'B', 'B')]
+    kept = result.filter_omega(m, raw)
+    assert [(r[1], r[3]) for r in kept] == [('2', ''), ('3', 'A'), ('3', 'B')]
+
+
+def test_omega_skips_a_later_chain_object_of_the_same_id_as_stock_does():
+    # stock's omegalyze takes the first conformer's altloc once per chain id: a second chain object with the
+    # same id and no altlocs ('' != 'A') loses its unaltered peptides; another chain id resets it
+    m = omega_model(['A', 'A', 'A', 'A', 'B', 'B'], [0, 0, 1, 1, 2, 2], {0: 'A'})
+    raw = [omega('A', '2', 'A', ''), omega('A', '4', '', ''), omega('B', '6', '', '')]
+    assert [r[1] for r in result.filter_omega(m, raw)] == ['2', '6']
+
+
+def test_omega_counts_by_residue_type():
+    kept = [omega('A', '2', '', '', 'Trans', 'PRO'), omega('A', '3', '', '', 'Cis', 'PRO'),
+            omega('A', '4', '', '', 'Twisted'), omega('A', '5', '', '', 'Trans')]
+    assert result.count_omega([r[:8] for r in kept]) == {
+        'proline': 2, 'general': 2, 'cis_proline': 1, 'cis_general': 0, 'twisted_proline': 0, 'twisted_general': 1}
+
+
+def test_protein_runs_as_iotbx_decides_them():
+    # chain.is_protein: amino acids outnumber nucleotides and are 80% of residues other than HOH (n), or all
+    # of those are UNK
+    counts = {0: {'n': 10, 'aa': 8, 'na': 0, 'unk': 0},  # and 30 HOH
+              1: {'n': 10, 'aa': 7, 'na': 0, 'unk': 0},
+              2: {'n': 4, 'aa': 0, 'na': 0, 'unk': 4},
+              3: {'n': 0, 'aa': 0, 'na': 0, 'unk': 0}}  # HOH only
+    assert result.protein_runs(counts) == {0, 2}
+
+
+def cablam(chain, resid, cablam_score, ca_score, altloc=''):
+    return (chain, resid, 'ALA', altloc, cablam_score, ca_score)
+
+
+def test_cablam_keeps_the_last_protein_chain_object_of_each_chain_id():
+    # cablamalyze keeps its results by chain id, so a later protein chain object of the same id replaces them
+    class Model:
+        residues = [('A', '1'), ('A', '2'), ('A', '3'), ('A', '4'), ('B', '5')]
+        run_of = [0, 0, 1, 1, 2]
+    records = [cablam('A', '2', 0.5, 0.5), cablam('A', '3', 0.5, 0.5), cablam('B', '5', 0.5, 0.5)]
+    assert [r[1] for r in result.filter_cablam(Model, records, {0, 1, 2})] == ['3', '5']
+    assert [r[1] for r in result.filter_cablam(Model, records, {0, 2})] == ['2', '5']
+
+
+def test_cablam_counts_as_stock_does():
+    records = [cablam('A', '1', None, None), cablam('A', '2', 0.004, 0.2), cablam('A', '3', 0.03, 0.001),
+               cablam('A', '3', 0.5, 0.5, 'B'), cablam('A', '4', 0.5, None), cablam('A', '5', None, None)]
+    assert result.count_cablam(records) == {'residues': 3, 'ca_residues': 2, 'outliers': 1, 'disfavored': 2,
+                                            'ca_outliers': 1}
+    # make_summary_stats adds the last residue's count once more after its loop: harmless where, as at the end
+    # of a chain, that residue has no CaBLAM score, counted twice where it has one
+    assert result.count_cablam(records[:5])['residues'] == 4

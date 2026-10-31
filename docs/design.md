@@ -42,7 +42,8 @@ proposed in cctbx/cctbx_project#1245 (see the README's Related work).
 ### Non-goals
 
 - Multi-model input (the caller splits models).
-- MolProbity's full report (percentiles, kinemages, Coot scripts).
+- MolProbity's full report: Rama-Z, Asn/Gln/His flips, RNA backbone,
+  missing atoms, hydrogen validation, percentiles, kinemages, Coot scripts.
 - Validation against experimental data (maps, structure factors).
 - Building or patching reduce and probe (the MolProbity installation
   provides them).
@@ -113,13 +114,13 @@ Canonical order: residues in file order; clashes by atom pair; outliers by
 atoms. Because of it, the result does not depend on the block layout, up
 to the last bits of values computed from restraints (success criterion 2).
 
-### Result, schema version 1
+### Result, schema version 2
 
 Plain Python data (lists, tuples, dicts, numbers, strings), pickled. A
 `-o` name ending in `.json`, or `-` (stdout), gives JSON instead. `read`
 takes either and restores tuples.
 
-- `schema`: `"remolprobity.result"`, `version`: 1.
+- `schema`: `"remolprobity.result"`, `version`: 2.
 - `provenance`: remolprobity version; cctbx commit; reduce and probe
   versions and the self-check result; input path, SHA-256, atom, residue
   and chain counts; block parameters, margin overhead and the margin of
@@ -135,6 +136,11 @@ takes either and restores tuples.
 - `clashes`: `clashscore`, `atoms` (probe's count, with hydrogens), and
   `(atom1, atom2, overlap, distance)`; an atom is
   `(chain, resid, resname, name, altloc)` in the model's names.
+- `molprobity_score`, from the clashscore and the rotamer and Ramachandran
+  counts, as `mmtbx.validation.utils.molprobity_score`.
+- `cbeta`, `omega`, `cablam`: counts as cbetadev, omegalyze and
+  cablamalyze count, and the records of outliers, of peptides that are not
+  trans, and of residues CaBLAM flags (README, Result).
 - `geometry`, per definition requested:
   - `v34`: as IHMValidation 3.4 (`mp_validate_bonds` scoring of the
     restraints; conformation-dependent library; symmetric side chains not
@@ -147,7 +153,8 @@ takes either and restores tuples.
     only when the file says it was used in refinement; flipped; outliers
     are covalent-geometry restraints beyond 4 sigma, as
     `(atoms..., observed, ideal, |z|)`; totals over covalent-type
-    restraints).
+    restraints). Also dihedrals, chiralities and planarities, as
+    `restraints.combined` counts them.
 - `residues`: per residue in file order, `(chain, resid, resname)` and, for
   `v34`, bonds and angles scored and their sum of Z² (what IHMValidation
   3.4 reports per residue; 3.3 has no per-residue geometry).
@@ -161,9 +168,10 @@ altloc field; 3.3 also drops clash distances and takes `v33` geometry.
 
 - A residue is owned by the block whose core holds its position. Merging
   asserts every input residue is owned exactly once.
-- Ramachandran and rotamer results belong to their residue; a bond or
-  angle to the residue of its first atom in cctbx's order; a clash to its
-  first atom in probe's order. Probe's order is the same in every block
+- Ramachandran, rotamer, C-beta and CaBLAM results belong to their
+  residue, a peptide's omega to the residue after it; a restraint to the
+  residue of its first atom in cctbx's order; a clash to its first atom in
+  probe's order. Probe's order is the same in every block
   because one table, built from the whole model's chain and residue names,
   gives the PDB names reduce and probe see.
 
@@ -207,6 +215,37 @@ refused. reduce joins neighbouring residues of one chain id and ignores TER,
 so reduce is given a spare chain id for each stretch (consecutive residues
 with one chain id in the model) that a block would otherwise join to another;
 its output is restored to the global names before probe and the cliques read it.
+
+A block also holds what keeps each of its chains as cctbx sees it in the
+whole model (`blocks._with_context`):
+
+- **Altloc order.** iotbx orders a chain object's conformers by the first
+  appearance of each altloc. A block holds, for each of its chain objects,
+  the residues where each altloc first appears (with and without
+  hydrogens), so that its first conformer is the model's.
+- **Gaps.** Two residues of one chain object with residues left out
+  between them follow each other in a block file, where cctbx would link
+  them if their ends can link: C or O3' to N or P within 3.5 Å, or CAs
+  within 4.5 Å where either lacks its main chain (CaBLAM). A block holds
+  the residues between such a pair.
+- **Links on atoms.** Sequence neighbours are linked by those atoms too,
+  not by CA (or centre) distance alone: nucleotides' centres are often
+  more than 5 Å apart.
+
+Two of stock's results depend on chains far away, and the merge applies
+stock's rule over the whole model:
+
+- **omegalyze** keeps a peptide without altlocs only from the conformer
+  whose altloc is that of the first peptide since the chain id last
+  changed. So a later chain object of the same chain id, with another
+  first conformer (none, after one with altlocs), keeps none of them.
+  Blocks report every conformer's peptides; `result.filter_omega` keeps
+  stock's.
+- **cablamalyze** keeps its results by chain id, so each protein chain
+  object replaces the one before it of that id. Blocks run CaBLAM on each
+  chain object on its own and report the residue counts by which iotbx's
+  `chain.is_protein` decides; `result.filter_cablam` keeps the last
+  protein chain object of each chain id.
 
 ### Tools
 

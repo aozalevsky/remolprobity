@@ -30,17 +30,25 @@ A2 = ('B', '1', 'ALA', 'CB', '')
 
 
 def sample(**changes):
-    r = {'schema': 'remolprobity.result', 'version': 1,
+    r = {'schema': 'remolprobity.result', 'version': 2,
          'provenance': {'remolprobity': '0.1.0', 'blocks': {'count': 3}, 'input': {'atoms': 40}},
          'ramachandran': {'total': 1, 'favored': 1, 'allowed': 0, 'outliers': 0,
                           'records': [('A', '2', 'SER', '', 'Favored', -60.0, -40.0, 0.9)]},
          'rotamers': {'total': 1, 'favored': 0, 'allowed': 0, 'outliers': 1,
                       'records': [('A', '2', 'SER', '', 'OUTLIER', 'OUTLIER', 0.1)]},
          'clashes': {'clashscore': 50.0, 'atoms': 20, 'records': [(A1, A2, 0.5, 2.1)]},
+         'molprobity_score': 2.5,
+         'cbeta': {'total': 1, 'outliers': 0, 'records': []},
+         'omega': {'proline': 0, 'general': 1, 'cis_proline': 0, 'cis_general': 0, 'twisted_proline': 0,
+                   'twisted_general': 0, 'records': []},
+         'cablam': {'residues': 1, 'ca_residues': 1, 'outliers': 0, 'disfavored': 0, 'ca_outliers': 0,
+                    'records': []},
          'geometry': {'v34': {'bonds': {'total': 2, 'outliers': [(A1, A2, 1.9, 1.5, 0.02, -20.0)]},
                               'angles': {'total': 3, 'outliers': []}},
                       'v33': {'bonds': {'total': 2, 'outliers': [(A1, A2, 1.9, 1.5, 20.0)]},
-                              'angles': {'total': 3, 'outliers': []}}},
+                              'angles': {'total': 3, 'outliers': []}, 'dihedrals': {'total': 4, 'outliers': []},
+                              'chiralities': {'total': 1, 'outliers': []},
+                              'planarities': {'total': 1, 'outliers': []}}},
          'residues': [{'chain': 'A', 'resid': '2', 'resname': 'SER', 'v34': {'bonds': [2, 1.0], 'angles': [3, 2.0]}}]}
     for path, value in changes.items():
         *keys, last = path.split('.')
@@ -137,3 +145,16 @@ def test_cli_unreadable(tmp_path, capsys):
     p.write_text('{}')
     assert compare.main([str(p), str(p)]) == 2
     assert 'not a remolprobity result' in capsys.readouterr().err
+
+
+def test_new_records_name_their_fields():
+    a = {'cbeta': {'records': [('A', '2', 'SER', '', 0.3, 10.0, 1.0)]},
+         'geometry': {'v33': {'planarities': {'outliers': [tuple(('A', '2', 'PHE', n, '') for n in
+                                                                 ('CG', 'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CB',
+                                                                  'HD1', 'HD2', 'HZ')) + (0.05, 0.1, 5.0)]}}}}
+    b = {'cbeta': {'records': [('A', '2', 'SER', '', 0.4, 10.0, 1.0)]},
+         'geometry': {'v33': {'planarities': {'outliers': [a['geometry']['v33']['planarities']['outliers'][0][:10] +
+                                                          (0.05, 0.1, 6.0)]}}}}
+    found = compare.differences(a, b)
+    assert '.cbeta.records[0].deviation: 0.3 != 0.4' in found
+    assert '.geometry.v33.planarities.outliers[0].z: 5.0 != 6.0' in found

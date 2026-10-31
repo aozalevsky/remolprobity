@@ -142,6 +142,8 @@ class Model:
     # {run: residues}: in each chain object with altlocs, the residues where each altloc first appears
     # (among all atoms, and among atoms other than hydrogens): iotbx orders a chain's conformers by that
     introducers: dict = None
+    # {run: altloc}: the first conformer's altloc of each chain object with altlocs, without hydrogens
+    conformer0: dict = None
 
     @property
     def n_atoms(self):
@@ -262,7 +264,9 @@ class _Table:
                      residue_names=list(self.names), occupancy_max=self.occupancy_max,
                      zero_occupancy=self.zero_occupancy, hydrogens=self.hydrogens,
                      run_of=np.array(self.runs, dtype=np.int64), link_out=ends[0], link_in=ends[1], link_more=more,
-                     has_ca=has_ca, mainchain=mainchain, introducers={run: sorted(ks) for run, ks in introducers.items()})
+                     has_ca=has_ca, mainchain=mainchain,
+                     introducers={run: sorted(ks) for run, ks in introducers.items()},
+                     conformer0={run: next(iter(first)) for run, first in self.first_altloc[1].items()})
 
 
 def _columns(path, tags):

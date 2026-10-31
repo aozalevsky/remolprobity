@@ -10,10 +10,13 @@ v34 - as IHMValidation 3.4 (molprobity_convert.py) computes it on the same
 v33 - as IHMValidation 3.3 (molprobity.molprobity's restraints.combined):
       no conformation-dependent library (molprobity.molprobity enables it
       only when the file says it was used in refinement), side chains
-      flipped; outliers are covalent-geometry restraints beyond 4 sigma,
-      totals all covalent-type restraints.
+      flipped. Bonds and angles: outliers are covalent-geometry restraints
+      beyond 4 sigma, totals all covalent-type restraints. Dihedrals and
+      chiralities: outliers covalent-geometry restraints beyond 4 sigma,
+      totals all restraints; planarities: outliers any plane whose largest
+      deviation is beyond 4 sigma, totals all planes.
 
-A bond or angle belongs to the residue of its first atom. Restraints are
+A restraint belongs to the residue of its first atom. Restraints are
 built without the NCS shortcut, so they don't depend on what else is in
 the block.
 """
@@ -146,7 +149,20 @@ def _v33(hierarchy, owned):
     def owned_result(o):
         return owned(*residue_key(o.atoms_info[0]))
 
+    def outliers(results, values):
+        return [tuple(atom_tuple(a) for a in o.atoms_info) + tuple(float(getattr(o, v)) for v in values)
+                for o in results if owned_result(o)]
+
+    def total(proxies):
+        return sum(1 for p in proxies if mine(p.i_seqs[0]))
+
     return {
+        'dihedrals': {'total': total(grm.dihedral_proxies),
+                      'outliers': outliers(r.dihedrals.results, ('model', 'target', 'score'))},
+        'chiralities': {'total': total(grm.chirality_proxies),
+                        'outliers': outliers(r.chiralities.results, ('model', 'target', 'score'))},
+        'planarities': {'total': total(grm.planarity_proxies),
+                        'outliers': outliers(r.planarities.results, ('rms_deltas', 'delta_max', 'score'))},
         'bonds': {'total': sum(1 for p in bonds.simple if p.origin_id in covalent and mine(p.i_seqs[0])),
                   'outliers': [tuple(atom_tuple(a) for a in o.atoms_info) +
                                (float(o.model), float(o.target), float(o.score))

@@ -4,8 +4,10 @@ compare remolprobity's results with (the oracle tests' reference).
 
 usage: remolprobity stock MODEL -o RESULT [--workdir DIR]
 
-molprobity.molprobity for Ramachandran, rotamers, clashes and the v33
-geometry (its restraints validation); IHMValidation 3.4's
+molprobity.molprobity for Ramachandran, rotamers, clashes, C-beta
+deviations, omega, the MolProbity score and the v33 geometry (its
+restraints validation), and CaBLAM as its model statistics run it;
+IHMValidation 3.4's
 molprobity_convert.py steps for the v34 geometry. Stock defaults throughout
 (NCS shortcut on), on an atom_site-only copy of the model, as IHMValidation
 gives it. Only when stock's hydrogen validation fails is it run again with
@@ -76,6 +78,8 @@ def reference(source, work):
     from iotbx.data_manager import DataManager
     from libtbx.utils import null_out
     from mmtbx.validation.mp_validate_bonds import mp_validate_bonds
+    from mmtbx.validation.cablam import cablamalyze
+    from mmtbx.validation.omegalyze import omega_types
 
     t0 = time.time()
     budget = memory.budget()  # before the model is read, as a run does
@@ -190,8 +194,24 @@ def reference(source, work):
 
     def v33(kind):
         r = getattr(v.restraints, kind)
+        values = ('rms_deltas', 'delta_max', 'score') if kind == 'planarities' else ('model', 'target', 'score')
         return {'total': r.n_total, 'outliers': [tuple(atom_tuple(a) for a in o.atoms_info) +
-                                                  (float(o.model), float(o.target), float(o.score)) for o in r.results]}
+                                                  tuple(float(getattr(o, x)) for x in values) for o in r.results]}
+
+    # stock runs cbetadev for its outliers only, and counts every residue
+    cb = v.cbetadev
+    cbeta = [(x.chain_id.strip(), residue_id(x.resseq, x.icode), x.resname.strip(), x.altloc.strip(),
+              float(x.deviation), float(x.dihedral_NABB), float(x.occupancy)) for x in cb.results]
+    # cablamalyze as stock's model statistics run it, on the same hierarchy, for its records
+    cab = cablamalyze(v.pdb_hierarchy, outliers_only=False, out=null_out(), quiet=True)
+    cablam = [(x.chain_id.strip(), residue_id(x.resseq, x.icode), x.resname.strip(), x.altloc.strip(),
+               None if x.scores.cablam is None else float(x.scores.cablam),
+               None if x.scores.c_alpha_geom is None else float(x.scores.c_alpha_geom))
+              for x in cab.results if x.has_ca]
+    om = v.omegalyze
+    omega = [(x.chain_id.strip(), residue_id(x.resseq, x.icode), x.resname.strip(), x.altloc.strip(),
+              residue_id(x.prev_resseq, x.prev_icode), x.prev_altloc.strip(), float(x.omega),
+              omega_types[x.omega_type]) for x in om.results]
 
     # v34 as IHMValidation 3.4's molprobity_convert.py
     dm = DataManager(['model'])
@@ -227,8 +247,14 @@ def reference(source, work):
 
     model = io.read_model(model_path)
     r = result.assemble(model.residues, model.resnames, rama, rota, clashes, pcm.n_atoms,
-                        {'v34': v34, 'v33': {'bonds': v33('bonds'), 'angles': v33('angles')}},
-                        residue_geometry, {},
+                        {'v34': v34, 'v33': {k: v33(k) for k in result.KINDS['v33']}},
+                        residue_geometry, {}, cbeta, omega, cablam,
+                        cbeta_counts={'total': cb.get_result_count(), 'outliers': cb.get_outlier_count()},
+                        omega_counts={k: getattr(om, 'n_' + k)() for k in result.OMEGA_COUNTS},
+                        cablam_counts={'residues': cab.count_residues(), 'ca_residues': cab.count_ca_residues(),
+                                       'outliers': cab.count_outliers(), 'disfavored': cab.count_disfavored(),
+                                       'ca_outliers': cab.count_ca_outliers()},
+                        score=float(v.molprobity_score()),
                         ramachandran_counts={k: getattr(v.ramalyze, 'n_' + k)
                                              for k in ('total', 'favored', 'allowed', 'outliers')},
                         rotamer_counts={k: getattr(v.rotalyze, 'n_' + k)

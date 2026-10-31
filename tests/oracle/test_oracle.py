@@ -11,9 +11,10 @@ every set must pass; some blocks may run again, never all.
 An entry marked refused_by_both is a model stock MolProbity cannot take:
 both oracles expect remolprobity to refuse it too, cleanly, and oracle 1
 checks that stock does.
-References are cached in the corpus directory, keyed by the model's SHA-256
-and by what stock's result depends on in the image: the reduce, probe and
-het dictionary hashes and the cctbx commit. Results are keyed by those, by
+References are cached in the corpus directory, keyed by the model's SHA-256,
+by what stock's result depends on in the image (the reduce, probe and
+het dictionary hashes and the cctbx commit) and by the SHA-256 of the code
+that turns stock's analyses into a result (stock.py, result.py). Results are keyed by those, by
 the SHA-256 of remolprobity's sources (remolprobity/**/*.py), and by the
 parameters; a change to any of them runs them again.
 
@@ -101,8 +102,17 @@ def source_sha256():
     return h.hexdigest()
 
 
+def reference_sha256():
+    """SHA-256 over the sources that make a reference from stock's analyses: what it holds and how it is counted"""
+    h = hashlib.sha256()
+    for name in ('stock.py', 'result.py'):
+        with open(os.path.join(REPO, 'remolprobity', name), 'rb') as f:
+            h.update(name.encode() + b'\0' + f.read() + b'\0')
+    return h.hexdigest()
+
+
 def reference_key():
-    return _sha256_json(image_state())[:16]
+    return _sha256_json(dict(image_state(), reference=reference_sha256()))[:16]
 
 
 def results_key():

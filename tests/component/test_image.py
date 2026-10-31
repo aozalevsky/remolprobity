@@ -1,12 +1,13 @@
 import pytest
 
+import remolprobity
 from helpers import STOCK_REDUCE, in_image
 
 
 @pytest.mark.container
 def test_remolprobity_imports_in_the_image():
     r = in_image('-c', 'import remolprobity, scipy, iotbx.pdb; print(remolprobity.__version__)')
-    assert r.stdout.strip() == '0.1.0'
+    assert r.stdout.strip() == remolprobity.__version__
 
 
 @pytest.mark.container

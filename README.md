@@ -1,8 +1,10 @@
 # remolprobity
 
 MolProbity validation of very large atomic models, in spatial blocks.
-remolprobity computes Ramachandran, rotamer, clash (with clashscore) and
-bond and angle validation for a model of any size. Its result is what stock
+remolprobity computes MolProbity's model validation for a model of any
+size: Ramachandran, rotamers, clashes (with clashscore), C-beta deviations,
+cis and twisted peptides (omega), CaBLAM, the MolProbity score, and bond,
+angle, dihedral, chirality and planarity restraints. Its result is what stock
 MolProbity gives on the whole model's atoms (an atom_site-only copy, as
 IHMValidation gives it, without crystal symmetry or header), but its memory
 is bounded by the block size, not by the size of the model.
@@ -20,9 +22,15 @@ remolprobity runs the same validators in blocks:
   residues (k-d median splits to a target size) plus a margin: every residue
   with an atom within 25 Å of the core (by default).
 - **Ownership.** Each block runs in its own process and keeps only what its
-  core owns. A residue owns its Ramachandran and rotamer results. A bond or
-  angle belongs to the residue of its first atom, and a clash to the residue
-  of its first atom in probe's order.
+  core owns. A residue owns its Ramachandran, rotamer, C-beta and CaBLAM
+  results, and the peptide before it (omega). A restraint (bond, angle,
+  dihedral, chirality, plane) belongs to the residue of its first atom, and a
+  clash to the residue of its first atom in probe's order.
+- **Chains as in the whole model.** A block holds, besides its core and
+  margin, what keeps its chains as cctbx sees them in the whole model: the
+  residues where each altloc of a chain first appears (iotbx orders
+  conformers by them), and the residues between two of its residues that
+  cctbx would otherwise link across the gap.
 - **Margin checks.** The plan checks that every block holds the sequence
   neighbours of the residues it owns. As it runs, each block checks that its
   margin holds reduce's hydrogen-bond cliques and the partners of its
@@ -31,7 +39,11 @@ remolprobity runs the same validators in blocks:
   stops.
 - **Merging.** The block results are merged in a canonical order: residues in
   file order, clashes by atom pair, outliers by atoms. So the result does not
-  depend on how the model was split.
+  depend on how the model was split. Where stock's result for a residue
+  depends on chains far away, the merge applies stock's rule over the whole
+  model: omegalyze keeps a peptide without altlocs only from the first
+  conformer of the first chain object of a chain id, and CaBLAM keeps one
+  chain object per chain id, the last that iotbx takes for protein.
 - **Only the atoms.** Block files carry the model's atoms and nothing else:
   no crystal symmetry (`CRYST1`, `_cell`, `_symmetry`) and no header. So no
   bond to a symmetry mate is built, and nothing in a header switches on the
@@ -50,9 +62,12 @@ The tests (see [Testing](#testing)) hold it to two standards:
    agree within 1e-9. Values can differ in their last bits because cctbx
    moves each block's coordinates into its own P1 box to build restraints.
 
-It does not compute the rest of MolProbity's report: percentiles, CaBLAM,
-C-beta deviations, hydrogen validation, kinemages or Coot scripts. Nor does
-it validate against experimental data.
+It does not compute the rest of MolProbity's report: Rama-Z (its secondary
+structure comes from whole chains), Asn/Gln/His flips (a second reduce run),
+RNA backbone validation, missing atoms, hydrogen validation, percentiles,
+kinemages or Coot scripts. CaBLAM's secondary-structure suggestions are left
+out too; its scores, flags and counts are not. Nor does it validate against
+experimental data.
 
 The design, with the reasons behind it, is in [docs/design.md](docs/design.md).
 
@@ -343,9 +358,9 @@ strings), written as a pickle or as JSON, as `-o` asks:
   them apart by content (`-` reads JSON from stdin). It turns arrays back
   into tuples and checks the schema and version.
 
-Schema version 1:
+Schema version 2:
 
-- `schema`: `"remolprobity.result"`, `version`: 1.
+- `schema`: `"remolprobity.result"`, `version`: 2.
 - `provenance`:
   - the remolprobity version and the cctbx commit;
   - reduce's and probe's versions and SHA-256, and the self-check result;
@@ -367,9 +382,25 @@ Schema version 1:
 - `clashes`: `clashscore`, `atoms` (probe's count, with hydrogens), and
   `records`, each `(atom1, atom2, overlap, distance)`. An atom is
   `(chain, resid, resname, name, altloc)`, in the model's names.
-- `geometry`: per definition requested, `bonds` and `angles`, each with a
+- `molprobity_score`: from the clashscore, the rotamer outliers and the
+  Ramachandran favoured residues, as `mmtbx.validation.utils.molprobity_score`
+  computes it (percentages 0 without protein, as stock takes them).
+- `cbeta`: `total` (residues and altlocs cbetadev measures) and `outliers`
+  (deviation of 0.25 Å or more), plus the outliers as `records`, each
+  `(chain, resid, resname, altloc, deviation, dihedral, occupancy)`.
+- `omega`: the peptides omegalyze measures, by the residue after them:
+  `proline` and `general`, and of each the `cis_` and `twisted_` counts;
+  plus the peptides that are not trans as `records`, each
+  `(chain, resid, resname, altloc, previous resid, previous altloc, omega, type)`.
+- `cablam`: `residues` (with a CaBLAM score), `ca_residues` (with a CA
+  geometry score), `outliers`, `disfavored` (which includes the outliers)
+  and `ca_outliers`, counted as cablamalyze's summary counts them; plus the
+  flagged residues as `records`, each
+  `(chain, resid, resname, altloc, cablam, ca_geometry)` (a score `None`
+  where CaBLAM has none).
+- `geometry`: per definition requested, its kinds of restraint, each with a
   `total` and its `outliers`:
-  - `v34`, as IHMValidation 3.4 computes it:
+  - `v34`, as IHMValidation 3.4 computes it: `bonds` and `angles`;
     - restraints scored as `mp_validate_bonds` scores them in the installed
       cctbx (covalent geometry and SS BOND on cctbx from 2026-08-19);
     - the conformation-dependent library is used, and symmetric side chains
@@ -377,12 +408,16 @@ Schema version 1:
     - outliers are beyond 5 sigma, as `(atoms..., observed, ideal, sigma, z)`;
     - totals exclude hydrogens.
   - `v33`, as IHMValidation 3.3 computes it, with `restraints.combined`:
+    `bonds`, `angles`, `dihedrals`, `chiralities` and `planarities`;
     - no conformation-dependent library (`molprobity.molprobity` enables it
       only when the file says it was used in refinement), and side chains are
       flipped;
-    - outliers are covalent-geometry restraints beyond 4 sigma, as
-      `(atoms..., observed, ideal, |z|)`;
-    - totals are over covalent-type restraints.
+    - outliers are beyond 4 sigma. Bonds, angles, dihedrals and chiralities:
+      covalent-geometry restraints, as `(atoms..., observed, ideal, |z|)`;
+      planarities: any plane by its largest deviation, as
+      `(atoms..., rms deviation, largest deviation, z)`;
+    - totals: bonds and angles over covalent-type restraints, the others
+      over all restraints, as `restraints.combined` counts them.
 - `residues`: one entry per residue, in file order: `chain`, `resid` and
   `resname`. With `v34`, it also holds the bonds and angles scored and their
   sum of Z² (`v34`: `{'bonds': [n, sum_z2], 'angles': [n, sum_z2]}`). This
@@ -450,6 +485,26 @@ Where stock MolProbity itself gets no result, or a different count:
 - **First conformer B.** Where a chain's first conformer is B, ramalyze can
   count a residue that it does not list. remolprobity counts from the
   records. No model in the test corpus has this case.
+
+Where stock's result depends on other chains, remolprobity follows it (the
+component tests build each case and compare with stock):
+
+- **omegalyze and repeated chain ids.** omegalyze keeps a peptide without
+  altlocs only from the conformer it met first since the chain id last
+  changed. A chain split into two chain objects of one id (by a TER, or by
+  a change of `label_asym_id` after an amino acid), whose first part has
+  altlocs and whose second has none, loses every peptide of the second
+  part: crambin split after residue 23, with altlocs at residue 5, has 24
+  peptides instead of 46.
+- **CaBLAM and repeated chain ids.** cablamalyze keeps one chain object
+  per chain id, the last one iotbx takes for protein. In the same split
+  crambin, only residues 24-46 have CaBLAM results.
+- **A residue in two chain objects** (the same chain and number, after a
+  TER or a change of `label_asym_id`, with another residue name or
+  altloc) is refused: iotbx keeps two residues there, which remolprobity,
+  naming residues by chain and number, cannot tell apart. Atom groups that
+  stock merges back into their residue (hydrogens listed at the end of the
+  file) are merged.
 
 ### Engines
 

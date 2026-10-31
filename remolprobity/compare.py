@@ -18,12 +18,17 @@ import sys
 # the fields of records, to name them in differences
 FIELDS = {'ramachandran': ('chain', 'resid', 'resname', 'altloc', 'class', 'phi', 'psi', 'score'),
           'rotamers': ('chain', 'resid', 'resname', 'altloc', 'evaluation', 'name', 'score'),
-          'clashes': ('atom1', 'atom2', 'overlap', 'distance')}
-OUTLIER_VALUES = {'v34': ('observed', 'ideal', 'sigma', 'z'), 'v33': ('observed', 'ideal', 'z')}
+          'clashes': ('atom1', 'atom2', 'overlap', 'distance'),
+          'cbeta': ('chain', 'resid', 'resname', 'altloc', 'deviation', 'dihedral', 'occupancy'),
+          'omega': ('chain', 'resid', 'resname', 'altloc', 'prev_resid', 'prev_altloc', 'omega', 'type'),
+          'cablam': ('chain', 'resid', 'resname', 'altloc', 'cablam', 'ca_geom')}
+OUTLIER_VALUES = {'v34': ('observed', 'ideal', 'sigma', 'z'), 'v33': ('observed', 'ideal', 'z'),
+                  'v33.planarities': ('rms', 'max', 'z')}
 ATOM = ('chain', 'resid', 'resname', 'name', 'altloc')
-RECORD = re.compile(r'\.(ramachandran|rotamers|clashes)\.records\[\d+\]$')
-OUTLIER = re.compile(r'\.geometry\.(v3[34])\.(?:bonds|angles)\.outliers\[\d+\]$')
-RECORD_ATOM = re.compile(r'\.(?:clashes\.records|geometry\.v3[34]\.(?:bonds|angles)\.outliers)\[\d+\]\.atom\d$')
+RECORD = re.compile(r'\.(ramachandran|rotamers|clashes|cbeta|omega|cablam)\.records\[\d+\]$')
+KIND = r'(?:bonds|angles|dihedrals|chiralities|planarities)'
+OUTLIER = re.compile(r'\.geometry\.(v3[34])\.(%s)\.outliers\[\d+\]$' % KIND)
+RECORD_ATOM = re.compile(r'\.(?:clashes\.records|geometry\.v3[34]\.%s\.outliers)\[\d+\]\.atom\d+$' % KIND)
 
 
 def _identity(record):
@@ -37,7 +42,7 @@ def _fields(path, n):
         return FIELDS[m.group(1)]
     m = OUTLIER.search(path)
     if m:
-        values = OUTLIER_VALUES[m.group(1)]
+        values = OUTLIER_VALUES.get('%s.%s' % m.groups(), OUTLIER_VALUES[m.group(1)])
         if n > len(values):
             return tuple('atom%d' % (i + 1) for i in range(n - len(values))) + values
     if RECORD_ATOM.search(path) and n == len(ATOM):
@@ -94,6 +99,15 @@ def summary(r):
          'Ramachandran': '%d, %d outliers' % (r['ramachandran']['total'], r['ramachandran']['outliers']),
          'rotamers': '%d, %d outliers' % (r['rotamers']['total'], r['rotamers']['outliers']),
          'clashscore': r['clashes']['clashscore'], 'clashes': len(r['clashes']['records'])}
+    if 'molprobity_score' in r:
+        s['MolProbity score'] = r['molprobity_score']
+        s['C-beta'] = '%d, %d outliers' % (r['cbeta']['total'], r['cbeta']['outliers'])
+        o = r['omega']
+        s['omega'] = '%d, cis %d (Pro %d), twisted %d' % (
+            o['proline'] + o['general'], o['cis_proline'] + o['cis_general'], o['cis_proline'],
+            o['twisted_proline'] + o['twisted_general'])
+        c = r['cablam']
+        s['CaBLAM'] = '%d, %d outliers, %d CA outliers' % (c['residues'], c['outliers'], c['ca_outliers'])
     return s
 
 

@@ -94,6 +94,14 @@ def run_block(task):
     rama = [r for r in residues.ramachandran(noh) if owned(r[0], r[1])]
     rota = [r for r in residues.rotamers(noh) if owned(r[0], r[1])]
     times['ramachandran_rotamers'] = time.time() - t
+    t = time.time()
+    # by the residue after the peptide, whose predecessor check_neighbours keeps in the block
+    cbeta = [r for r in residues.cbeta(noh) if owned(r[0], r[1])]
+    omega = [r for r in residues.omegas(noh) if owned(r[0], r[1])]
+    times['cbeta_omega'] = time.time() - t
+    t = time.time()
+    cablam, cablam_classes = residues.cablam(noh, owned)
+    times['cablam'] = time.time() - t
 
     core = [a.xyz for a in noh.atoms() if owned(*residue_key(a.fetch_labels()))]
     margin = task.get('margin', s['margin'])
@@ -117,7 +125,9 @@ def run_block(task):
     os.rmdir(workdir)
     times['total'] = time.time() - t0
     return {'block': b, 'atoms': h.atoms_size(), 'owned': owned_keys, 'ramachandran': rama,
-            'rotamers': rota, 'clashes': clash['records'], 'probe_atoms': clash['probe_atoms'],
+            'rotamers': rota, 'cbeta': cbeta, 'omega': omega, 'cablam': cablam, 'cablam_classes': cablam_classes,
+            'clashes': clash['records'],
+            'probe_atoms': clash['probe_atoms'],
             'geometry': geo, 'times': times,
             'peak_gb': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
             # the largest of its reduce and probe processes
