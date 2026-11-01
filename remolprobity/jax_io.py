@@ -3,6 +3,7 @@ Pure-Python hierarchy reader and adapter matching iotbx.pdb.hierarchy semantics
 (PDB construct_hierarchy, mmCIF pdb_hierarchy_builder, _hd_selection,
 merge_atoms_at_end_to_residues, flip_symmetric_amino_acids, and conformers()).
 """
+import os
 import numpy as np
 from .io import (
     InputError,
@@ -582,6 +583,35 @@ class JaxHierarchy:
             h.append_model(m.detached_copy())
         return h
 
+    def remove_hd_in_place(self):
+        """Remove H/D atoms in place without duplicating JaxAtom/JaxResidueGroup objects."""
+        i_seq = 0
+        for m in self._models:
+            for ch in list(m._chains):
+                for rg in list(ch._residue_groups):
+                    for ag in list(rg._atom_groups):
+                        resname_strip = ag.resname.strip()
+                        kept = []
+                        for a in ag._atoms:
+                            e = a.element.strip()
+                            if e:
+                                is_hd = e in ("H", "D")
+                            else:
+                                name = a.name.strip().lstrip("0123456789")
+                                is_hd = name[:1] in ("H", "D") and resname_strip != name
+                            if not is_hd:
+                                a.i_seq = i_seq
+                                i_seq += 1
+                                kept.append(a)
+                        ag._atoms = kept
+                        if not kept:
+                            rg.remove_atom_group(ag)
+                    if rg.atom_groups_size() == 0:
+                        ch.remove_residue_group(rg)
+                if ch.residue_groups_size() == 0:
+                    m.remove_chain(ch)
+        return self
+
     def select_non_hd(self):
         """Return a deep copy with H/D atoms removed (matching worker._hd_selection)."""
         h = JaxHierarchy()
@@ -991,12 +1021,12 @@ def read_hierarchy(path, check=True, zero_occupancy_as_one=False, missing_b_as_z
     return _read_pdb_hierarchy(path, check, zero_occupancy_as_one)
 
 
-def prepare_noh_hierarchy(hierarchy):
+def prepare_noh_hierarchy(hierarchy, in_place=False):
     """
     Prepare a non-H hierarchy matching worker.py lines 87-91:
     select(~hd) -> merge_atoms_at_end_to_residues() -> reset_i_seq() -> flip_symmetric_amino_acids().
     """
-    noh = hierarchy.select_non_hd()
+    noh = hierarchy.remove_hd_in_place() if in_place else hierarchy.select_non_hd()
     noh.merge_atoms_at_end_to_residues()
     noh.reset_i_seq()
     noh.flip_symmetric_amino_acids()
