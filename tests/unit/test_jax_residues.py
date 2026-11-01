@@ -20,7 +20,7 @@ def _unique_ref_files():
     for p in sorted(glob.glob(os.path.join(CORPUS_DIR, "reference", "*.pkl"))):
         base = os.path.basename(p)
         name = base.split(".")[0]
-        if name not in by_name or base.endswith(".742d1a0065642254.pkl"):
+        if name not in by_name or base.endswith(".3c1d5676313508f6.pkl"):
             by_name[name] = p
     return [by_name[k] for k in sorted(by_name)]
 
@@ -72,3 +72,20 @@ def test_jax_residues_against_cached_stock_oracle(ref_path):
 
     assert compare.differences(ref["ramachandran"], rama_dict, tol=1e-6) == []
     assert compare.differences(ref["rotamers"], rota_dict, tol=1e-6) == []
+
+    if "cbeta" in ref:
+        cb_raw = jax_residues.cbeta(noh)
+        om_raw = jax_residues.omegas(noh)
+        cab_rec, cab_cls = jax_residues.cablam(noh, lambda c, r: True)
+
+        by_residue = lambda r: (index[(r[0], r[1])], r[3], r)
+        om = result.filter_omega(m, om_raw)
+        cab = result.filter_cablam(m, cab_rec, result.protein_runs(result.cablam_runs(m, cab_cls)))
+
+        cb_dict = dict(result.count_cbeta(cb_raw), records=sorted(result.cbeta_outliers(cb_raw), key=by_residue))
+        om_dict = dict(result.count_omega(om), records=sorted((r for r in om if r[7] != "Trans"), key=by_residue))
+        cab_dict = dict(result.count_cablam(cab), records=sorted(result.cablam_flagged(cab), key=by_residue))
+
+        assert compare.differences(ref["cbeta"], cb_dict, tol=1e-6) == []
+        assert compare.differences(ref["omega"], om_dict, tol=1e-6) == []
+        assert compare.differences(ref["cablam"], cab_dict, tol=1e-6) == []

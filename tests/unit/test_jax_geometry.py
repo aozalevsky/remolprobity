@@ -21,7 +21,7 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 def _load_restraint_npz(npz_path, defn):
     d = np.load(npz_path, allow_pickle=False)
-    return {
+    out = {
         "xyz": d[f"{defn}_xyz"],
         "is_h": d[f"{defn}_is_h"],
         "atom_tuples": d[f"{defn}_atom_tuples"],
@@ -34,6 +34,27 @@ def _load_restraint_npz(npz_path, defn):
         "angle_weight": d[f"{defn}_angle_weight"],
         "angle_origin_id": d[f"{defn}_angle_origin_id"],
     }
+    if defn == "v33" and "v33_dihedral_iseqs" in d:
+        out.update({
+            "dihedral_iseqs": d["v33_dihedral_iseqs"],
+            "dihedral_ideal": d["v33_dihedral_ideal"],
+            "dihedral_weight": d["v33_dihedral_weight"],
+            "dihedral_periodicity": d["v33_dihedral_periodicity"],
+            "dihedral_slack": d["v33_dihedral_slack"],
+            "dihedral_limit": d["v33_dihedral_limit"],
+            "dihedral_top_out": d["v33_dihedral_top_out"],
+            "dihedral_origin_id": d["v33_dihedral_origin_id"],
+            "dihedral_alt_ideals": d["v33_dihedral_alt_ideals"],
+            "chirality_iseqs": d["v33_chirality_iseqs"],
+            "chirality_ideal": d["v33_chirality_ideal"],
+            "chirality_weight": d["v33_chirality_weight"],
+            "chirality_both_signs": d["v33_chirality_both_signs"],
+            "chirality_origin_id": d["v33_chirality_origin_id"],
+            "planarity_iseqs": d["v33_planarity_iseqs"],
+            "planarity_weights": d["v33_planarity_weights"],
+            "planarity_origin_id": d["v33_planarity_origin_id"],
+        })
+    return out
 
 
 def _find_cached_entries():
@@ -43,7 +64,7 @@ def _find_cached_entries():
     for pkl_path in sorted(glob.glob(os.path.join(REF_DIR, "*.pkl"))):
         base = os.path.basename(pkl_path)
         name = base.split(".")[0]
-        if name in by_name and not base.endswith(".742d1a0065642254.pkl"):
+        if name in by_name and not base.endswith(".3c1d5676313508f6.pkl"):
             continue
         npz_path = os.path.join(CACHE_DIR, f"{name}.npz")
         if not os.path.exists(npz_path):
@@ -132,11 +153,13 @@ def test_jax_geometry_matches_oracle_reference(name, model_path, pkl_path, npz_p
         {"v34": g34, "v33": g33},
         g34["residues"],
         {},
+        [],
+        [],
+        [],
     )
 
     assert compare.differences(ref["geometry"]["v34"], assembled["geometry"]["v34"], tol=1e-6) == []
-    assert compare.differences(ref["geometry"]["v33"]["bonds"], assembled["geometry"]["v33"]["bonds"], tol=1e-6) == []
-    assert compare.differences(ref["geometry"]["v33"]["angles"], assembled["geometry"]["v33"]["angles"], tol=1e-6) == []
+    assert compare.differences(ref["geometry"]["v33"], assembled["geometry"]["v33"], tol=1e-6) == []
     assert compare.differences(ref["residues"], assembled["residues"], tol=1e-6) == []
 
 
@@ -155,7 +178,7 @@ def test_jax_geometry_splits_by_ownership():
         p1 = jax_geometry.score(defn, None, lambda c, r: (c, r) in half, restraint_data=data)
         p2 = jax_geometry.score(defn, None, lambda c, r: (c, r) not in half, restraint_data=data)
 
-        for kind in ("bonds", "angles"):
+        for kind in result.KINDS[defn]:
             assert whole[kind]["total"] == p1[kind]["total"] + p2[kind]["total"]
             assert sorted(whole[kind]["outliers"]) == sorted(p1[kind]["outliers"] + p2[kind]["outliers"])
         if defn == "v34":

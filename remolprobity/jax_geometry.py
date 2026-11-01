@@ -209,6 +209,333 @@ def eval_angles_jax(xyz, iseqs, ideal, weight):
     return np.asarray(m), np.asarray(d), np.asarray(s), np.asarray(z)
 
 
+@jax.jit
+def _eval_dihedrals_kernel(
+    xyz, iseqs, ideal, weight, periodicity, slack, limit, top_out, alt_ideals
+):
+    """
+    Evaluate 4-point dihedral restraints (in degrees), residuals, and sigma scores
+    in float64 on GPU. Matches cctbx::geometry_restraints::dihedral.
+    """
+    p0 = xyz[iseqs[:, 0]]
+    p1 = xyz[iseqs[:, 1]]
+    p2 = xyz[iseqs[:, 2]]
+    p3 = xyz[iseqs[:, 3]]
+    d_01 = p0 - p1
+    d_21 = p2 - p1
+    d_23 = p2 - p3
+    n_0121 = jnp.cross(d_01, d_21)
+    n_2123 = jnp.cross(d_21, d_23)
+    n_0121_norm = jnp.sum(n_0121 * n_0121, axis=-1)
+    n_2123_norm = jnp.sum(n_2123 * n_2123, axis=-1)
+    have_angle = (n_0121_norm != 0.0) & (n_2123_norm != 0.0)
+
+    angle_model = dihedral_angles_jax(p0, p1, p2, p3)
+    half_period = 180.0 / jnp.maximum(1, jnp.abs(periodicity)).astype(jnp.float64)
+    period = 2.0 * half_period
+    raw_d = jnp.fmod(ideal - angle_model, period)
+    delta = jnp.where(
+        raw_d < -half_period,
+        raw_d + period,
+        jnp.where(raw_d > half_period, raw_d - period, raw_d),
+    )
+
+    # Optional alt_angle_ideals (shape (N, 6), NaN for unused)
+    for k in range(6):
+        ak = alt_ideals[:, k]
+        valid_alt = ~jnp.isnan(ak)
+        a_val = jnp.where(valid_alt, ak, 0.0)
+        a_val = jnp.where(a_val < 0.0, a_val + 360.0, a_val)
+        raw_di = jnp.fmod(a_val - angle_model, 360.0)
+        delta_i = jnp.where(
+            raw_di < -180.0,
+            raw_di + 360.0,
+            jnp.where(raw_di > 180.0, raw_di - 360.0, raw_di),
+        )
+        delta = jnp.where(valid_alt & (jnp.abs(delta) > jnp.abs(delta_i)), delta_i, delta)
+
+    delta = jnp.where(have_angle, delta, 0.0)
+    delta_local = jnp.where(
+        slack <= 0.0,
+        delta,
+        jnp.where(
+            delta > slack,
+            delta - slack,
+            jnp.where(delta < -slack, delta + slack, 0.0),
+        ),
+    )
+
+    pi_180 = jnp.pi / 180.0
+    p_f = jnp.maximum(1, periodicity).astype(jnp.float64)
+    sin_term = (9600.0 / (p_f * p_f)) * (1.0 - jnp.cos(p_f * delta_local * pi_180))
+    use_top = (periodicity <= 0) & top_out & (limit >= 0.0)
+    top = jnp.where(use_top, jnp.maximum(weight * limit * limit, 1e-30), 1.0)
+    top_res = top * (1.0 - jnp.exp(-weight * delta_local * delta_local / top))
+    harm_res = weight * delta_local * delta_local
+    residual = jnp.where(
+        periodicity > 0,
+        weight * sin_term,
+        jnp.where(use_top, top_res, harm_res),
+    )
+    sigma = jnp.sqrt(1.0 / weight)
+    score = jnp.abs(delta) / sigma
+    return angle_model, delta, residual, score
+
+
+def eval_dihedrals_jax(
+    xyz, iseqs, ideal, weight, periodicity, slack, limit, top_out, alt_ideals
+):
+    """Bucket-padded wrapper around _eval_dihedrals_kernel."""
+    n = len(iseqs)
+    if n == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty, empty, empty
+    bucket = _next_bucket(n)
+    xyz_j = jnp.asarray(xyz, dtype=jnp.float64)
+    if bucket > n:
+        pad = bucket - n
+        iseqs_p = np.pad(iseqs, ((0, pad), (0, 0)), mode="constant")
+        ideal_p = np.pad(ideal, (0, pad), mode="constant")
+        weight_p = np.pad(weight, (0, pad), mode="constant", constant_values=1.0)
+        period_p = np.pad(periodicity, (0, pad), mode="constant")
+        slack_p = np.pad(slack, (0, pad), mode="constant")
+        limit_p = np.pad(limit, (0, pad), mode="constant", constant_values=-1.0)
+        top_p = np.pad(top_out, (0, pad), mode="constant")
+        alt_p = np.pad(alt_ideals, ((0, pad), (0, 0)), mode="constant", constant_values=np.nan)
+        m, d, r, sc = _eval_dihedrals_kernel(
+            xyz_j,
+            jnp.asarray(iseqs_p, dtype=jnp.int32),
+            jnp.asarray(ideal_p, dtype=jnp.float64),
+            jnp.asarray(weight_p, dtype=jnp.float64),
+            jnp.asarray(period_p, dtype=jnp.int32),
+            jnp.asarray(slack_p, dtype=jnp.float64),
+            jnp.asarray(limit_p, dtype=jnp.float64),
+            jnp.asarray(top_p, dtype=jnp.bool_),
+            jnp.asarray(alt_p, dtype=jnp.float64),
+        )
+        return np.asarray(m[:n]), np.asarray(d[:n]), np.asarray(r[:n]), np.asarray(sc[:n])
+    m, d, r, sc = _eval_dihedrals_kernel(
+        xyz_j,
+        jnp.asarray(iseqs, dtype=jnp.int32),
+        jnp.asarray(ideal, dtype=jnp.float64),
+        jnp.asarray(weight, dtype=jnp.float64),
+        jnp.asarray(periodicity, dtype=jnp.int32),
+        jnp.asarray(slack, dtype=jnp.float64),
+        jnp.asarray(limit, dtype=jnp.float64),
+        jnp.asarray(top_out, dtype=jnp.bool_),
+        jnp.asarray(alt_ideals, dtype=jnp.float64),
+    )
+    return np.asarray(m), np.asarray(d), np.asarray(r), np.asarray(sc)
+
+
+@jax.jit
+def _eval_chiralities_kernel(xyz, iseqs, ideal, weight, both_signs):
+    """
+    Evaluate 4-point chiral volumes, deltas, residuals, and sigma scores in float64 on GPU.
+    Matches cctbx::geometry_restraints::chirality.
+    """
+    p0 = xyz[iseqs[:, 0]]
+    p1 = xyz[iseqs[:, 1]]
+    p2 = xyz[iseqs[:, 2]]
+    p3 = xyz[iseqs[:, 3]]
+    d_01 = p1 - p0
+    d_02 = p2 - p0
+    d_03 = p3 - p0
+    volume_model = jnp.sum(d_01 * jnp.cross(d_02, d_03), axis=-1)
+    delta_sign = jnp.where(both_signs & (volume_model < 0.0), 1.0, -1.0)
+    delta = ideal + delta_sign * volume_model
+    residual = weight * delta * delta
+    sigma = jnp.sqrt(1.0 / weight)
+    score = jnp.abs(delta) / sigma
+    return volume_model, delta, residual, score
+
+
+def eval_chiralities_jax(xyz, iseqs, ideal, weight, both_signs):
+    """Bucket-padded wrapper around _eval_chiralities_kernel."""
+    n = len(iseqs)
+    if n == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty, empty, empty
+    bucket = _next_bucket(n)
+    xyz_j = jnp.asarray(xyz, dtype=jnp.float64)
+    if bucket > n:
+        pad = bucket - n
+        iseqs_p = np.pad(iseqs, ((0, pad), (0, 0)), mode="constant")
+        ideal_p = np.pad(ideal, (0, pad), mode="constant")
+        weight_p = np.pad(weight, (0, pad), mode="constant", constant_values=1.0)
+        both_p = np.pad(both_signs, (0, pad), mode="constant")
+        m, d, r, sc = _eval_chiralities_kernel(
+            xyz_j,
+            jnp.asarray(iseqs_p, dtype=jnp.int32),
+            jnp.asarray(ideal_p, dtype=jnp.float64),
+            jnp.asarray(weight_p, dtype=jnp.float64),
+            jnp.asarray(both_p, dtype=jnp.bool_),
+        )
+        return np.asarray(m[:n]), np.asarray(d[:n]), np.asarray(r[:n]), np.asarray(sc[:n])
+    m, d, r, sc = _eval_chiralities_kernel(
+        xyz_j,
+        jnp.asarray(iseqs, dtype=jnp.int32),
+        jnp.asarray(ideal, dtype=jnp.float64),
+        jnp.asarray(weight, dtype=jnp.float64),
+        jnp.asarray(both_signs, dtype=jnp.bool_),
+    )
+    return np.asarray(m), np.asarray(d), np.asarray(r), np.asarray(sc)
+
+
+def _jacobi_3x3_normal_single(a_init):
+    """
+    Exact replica of scitbx::matrix::eigensystem::detail::real_symmetric_given_lower_triangle
+    (scitbx/matrix/eigensystem.h:22-156) for n=3, returning the eigenvector
+    corresponding to the smallest eigenvalue (with bit-exact sign!).
+    a_init: (6,) float64 array [m00, m10, m11, m20, m21, m22].
+    """
+    vecs_init = jnp.eye(3, dtype=jnp.float64)
+    anorm = jnp.sqrt(2.0 * (a_init[1] * a_init[1] + a_init[3] * a_init[3] + a_init[4] * a_init[4]))
+    anrmx = 1e-10 * anorm / 3.0
+
+    def _rotate_pair(a, vecs, ind, thr, l, m, ll, mm, lm, il, im):
+        cond = (a[lm] * a[lm]) > (thr * thr)
+        x = 0.5 * (a[ll] - a[mm])
+        denom = jnp.sqrt(a[lm] * a[lm] + x * x)
+        safe_denom = jnp.where(denom > 0.0, denom, 1.0)
+        y = -a[lm] / safe_denom
+        y = jnp.where(x < 0.0, -y, y)
+        sinx = y / jnp.sqrt(2.0 * (1.0 + jnp.sqrt(jnp.maximum(0.0, 1.0 - y * y))))
+        sinx2 = sinx * sinx
+        cosx = jnp.sqrt(jnp.maximum(0.0, 1.0 - sinx2))
+        cosx2 = cosx * cosx
+        sincs = sinx * cosx
+
+        new_il = a[il] * cosx - a[im] * sinx
+        new_im = a[il] * sinx + a[im] * cosx
+        x2 = 2.0 * a[lm] * sincs
+        new_ll = a[ll] * cosx2 + a[mm] * sinx2 - x2
+        new_mm = a[ll] * sinx2 + a[mm] * cosx2 + x2
+        new_lm = (a[ll] - a[mm]) * sincs + a[lm] * (cosx2 - sinx2)
+
+        a_new = a.at[il].set(new_il).at[im].set(new_im).at[ll].set(new_ll).at[mm].set(new_mm).at[lm].set(new_lm)
+        vl = vecs[l] * cosx - vecs[m] * sinx
+        vm = vecs[l] * sinx + vecs[m] * cosx
+        vecs_new = vecs.at[l].set(vl).at[m].set(vm)
+
+        return (
+            jnp.where(cond, a_new, a),
+            jnp.where(cond, vecs_new, vecs),
+            jnp.where(cond, jnp.int32(1), ind),
+        )
+
+    def _inner_cond(state):
+        _, _, ind, _ = state
+        return ind == 1
+
+    def _inner_body(state):
+        a, vecs, _, thr = state
+        ind = jnp.int32(0)
+        # (l=0, m=1): ll=0, mm=2, lm=1, other i=2 -> il=3, im=4
+        a, vecs, ind = _rotate_pair(a, vecs, ind, thr, 0, 1, 0, 2, 1, 3, 4)
+        # (l=0, m=2): ll=0, mm=5, lm=3, other i=1 -> il=1, im=4
+        a, vecs, ind = _rotate_pair(a, vecs, ind, thr, 0, 2, 0, 5, 3, 1, 4)
+        # (l=1, m=2): ll=2, mm=5, lm=4, other i=0 -> il=1, im=3
+        a, vecs, ind = _rotate_pair(a, vecs, ind, thr, 1, 2, 2, 5, 4, 1, 3)
+        return (a, vecs, ind, thr)
+
+    def _outer_cond(state):
+        _, _, thr = state
+        return (anorm > 0.0) & (thr > anrmx)
+
+    def _outer_body(state):
+        a, vecs, thr = state
+        thr_next = thr / 3.0
+        a, vecs, _, _ = jax.lax.while_loop(_inner_cond, _inner_body, (a, vecs, jnp.int32(1), thr_next))
+        return (a, vecs, thr_next)
+
+    a, vecs, _ = jax.lax.while_loop(_outer_cond, _outer_body, (a_init, vecs_init, anorm))
+
+    # Sort eigenvalues [a[0], a[2], a[5]] and eigenvectors in descending order
+    # Matching scitbx/matrix/eigensystem.h:124-150
+    e0, e1, e2 = a[0], a[2], a[5]
+    v0, v1, v2 = vecs[0], vecs[1], vecs[2]
+
+    # i = 0
+    swap01 = e1 > e0
+    am0 = jnp.where(swap01, e1, e0)
+    im0 = jnp.where(swap01, 1, 0)
+    swap02 = e2 > am0
+    im0 = jnp.where(swap02, 2, im0)
+
+    e0_1 = jnp.where(im0 == 1, e1, jnp.where(im0 == 2, e2, e0))
+    e1_1 = jnp.where(im0 == 1, e0, e1)
+    e2_1 = jnp.where(im0 == 2, e0, e2)
+    v0_1 = jnp.where(im0 == 1, v1, jnp.where(im0 == 2, v2, v0))
+    v1_1 = jnp.where(im0 == 1, v0, v1)
+    v2_1 = jnp.where(im0 == 2, v0, v2)
+
+    # i = 1
+    swap12 = e2_1 > e1_1
+    v2_final = jnp.where(swap12, v1_1, v2_1)
+    return v2_final
+
+
+@jax.jit
+def _eval_planarities_kernel(xyz, iseqs, weights):
+    """
+    Evaluate multi-atom planarity restraints on GPU in float64.
+    Matches cctbx::geometry_restraints::planarity and mmtbx.validation.restraints.planarities.
+    """
+    valid = iseqs >= 0
+    safe_iseqs = jnp.maximum(iseqs, 0)
+    sites = xyz[safe_iseqs]  # (N, M, 3)
+    w = jnp.where(valid, weights, 0.0)  # (N, M)
+    sum_w = jnp.sum(w, axis=1, keepdims=True)  # (N, 1)
+    com = jnp.sum(w[:, :, None] * sites, axis=1) / jnp.maximum(sum_w, 1e-30)  # (N, 3)
+    x = jnp.where(valid[:, :, None], sites - com[:, None, :], 0.0)  # (N, M, 3)
+
+    a0 = jnp.sum(w * x[:, :, 0] * x[:, :, 0], axis=1)
+    a1 = jnp.sum(w * x[:, :, 1] * x[:, :, 0], axis=1)
+    a2 = jnp.sum(w * x[:, :, 1] * x[:, :, 1], axis=1)
+    a3 = jnp.sum(w * x[:, :, 2] * x[:, :, 0], axis=1)
+    a4 = jnp.sum(w * x[:, :, 2] * x[:, :, 1], axis=1)
+    a5 = jnp.sum(w * x[:, :, 2] * x[:, :, 2], axis=1)
+    a_mat = jnp.stack([a0, a1, a2, a3, a4, a5], axis=-1)  # (N, 6)
+
+    n_min = jax.vmap(_jacobi_3x3_normal_single)(a_mat)  # (N, 3)
+    deltas = jnp.sum(x * n_min[:, None, :], axis=-1)  # (N, M)
+    deltas = jnp.where(valid, deltas, 0.0)
+
+    n_sites = jnp.maximum(1, jnp.sum(valid.astype(jnp.int32), axis=1)).astype(jnp.float64)
+    rms_deltas = jnp.sqrt(jnp.sum(deltas * deltas, axis=1) / n_sites)
+    residual = jnp.sum(w * deltas * deltas, axis=1)
+
+    sigma_site = jnp.sqrt(1.0 / jnp.where(valid & (w > 0.0), w, 1.0))
+    # Note: mmtbx/validation/restraints.py:665-672 uses signed a[1] (delta)
+    delta_max = jnp.max(jnp.where(valid, deltas, -1e30), axis=1)
+    score = jnp.max(jnp.where(valid, deltas / sigma_site, -1e30), axis=1)
+    return rms_deltas, delta_max, residual, score
+
+
+def eval_planarities_jax(xyz, iseqs, weights):
+    """Bucket-padded wrapper around _eval_planarities_kernel."""
+    n = len(iseqs)
+    if n == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty, empty, empty
+    m_cols = iseqs.shape[1]
+    # Pad m_cols to next multiple of 8 (or 20) to avoid recompilation across plane sizes
+    m_pad = max(20, ((m_cols + 7) // 8) * 8)
+    bucket = _next_bucket(n)
+    xyz_j = jnp.asarray(xyz, dtype=jnp.float64)
+    pad_n = bucket - n
+    pad_m = m_pad - m_cols
+    iseqs_p = np.pad(iseqs, ((0, pad_n), (0, pad_m)), mode="constant", constant_values=-1)
+    weights_p = np.pad(weights, ((0, pad_n), (0, pad_m)), mode="constant", constant_values=0.0)
+    rms, dmax, res, sc = _eval_planarities_kernel(
+        xyz_j,
+        jnp.asarray(iseqs_p, dtype=jnp.int32),
+        jnp.asarray(weights_p, dtype=jnp.float64),
+    )
+    return np.asarray(rms[:n]), np.asarray(dmax[:n]), np.asarray(res[:n]), np.asarray(sc[:n])
+
+
 @functools.partial(jax.jit, static_argnums=(3,))
 def _accumulate_residue_rmsz_kernel(z_sq, keep_mask, res_idx, n_residues):
     """Accumulate per-residue count and sum(z^2) on GPU via segment_sum."""
@@ -592,7 +919,7 @@ def extract_restraints(hierarchy, definition):
         angle_origin_id[j] = p.origin_id
 
     atom_tuples = [atom_tuple(a.fetch_labels()) for a in atoms]
-    return {
+    out = {
         'xyz': xyz,
         'is_h': is_h,
         'atom_tuples': atom_tuples,
@@ -605,6 +932,77 @@ def extract_restraints(hierarchy, definition):
         'angle_weight': angle_weight,
         'angle_origin_id': angle_origin_id,
     }
+    if definition == 'v33':
+        dp = grm.dihedral_proxies
+        nd = dp.size()
+        d_iseqs = np.empty((nd, 4), dtype=np.int32)
+        d_ideal = np.empty(nd, dtype=np.float64)
+        d_weight = np.empty(nd, dtype=np.float64)
+        d_period = np.empty(nd, dtype=np.int32)
+        d_slack = np.empty(nd, dtype=np.float64)
+        d_limit = np.empty(nd, dtype=np.float64)
+        d_top_out = np.empty(nd, dtype=bool)
+        d_origin = np.empty(nd, dtype=np.uint8)
+        d_alt = np.full((nd, 6), np.nan, dtype=np.float64)
+        for j, p in enumerate(dp):
+            d_iseqs[j] = p.i_seqs
+            d_ideal[j] = p.angle_ideal
+            d_weight[j] = p.weight
+            d_period[j] = p.periodicity
+            d_slack[j] = p.slack
+            d_limit[j] = p.limit
+            d_top_out[j] = p.top_out
+            d_origin[j] = p.origin_id
+            if p.alt_angle_ideals:
+                for k, a in enumerate(p.alt_angle_ideals):
+                    d_alt[j, k] = a
+
+        cp = grm.chirality_proxies
+        nc = cp.size()
+        c_iseqs = np.empty((nc, 4), dtype=np.int32)
+        c_ideal = np.empty(nc, dtype=np.float64)
+        c_weight = np.empty(nc, dtype=np.float64)
+        c_both = np.empty(nc, dtype=bool)
+        c_origin = np.empty(nc, dtype=np.uint8)
+        for j, p in enumerate(cp):
+            c_iseqs[j] = p.i_seqs
+            c_ideal[j] = p.volume_ideal
+            c_weight[j] = p.weight
+            c_both[j] = p.both_signs
+            c_origin[j] = p.origin_id
+
+        pp = grm.planarity_proxies
+        npl = pp.size()
+        max_pl = max((len(p.i_seqs) for p in pp), default=4)
+        p_iseqs = np.full((npl, max_pl), -1, dtype=np.int32)
+        p_weights = np.zeros((npl, max_pl), dtype=np.float64)
+        p_origin = np.empty(npl, dtype=np.uint8)
+        for j, p in enumerate(pp):
+            k = len(p.i_seqs)
+            p_iseqs[j, :k] = list(p.i_seqs)
+            p_weights[j, :k] = list(p.weights)
+            p_origin[j] = p.origin_id
+
+        out.update({
+            'dihedral_iseqs': d_iseqs,
+            'dihedral_ideal': d_ideal,
+            'dihedral_weight': d_weight,
+            'dihedral_periodicity': d_period,
+            'dihedral_slack': d_slack,
+            'dihedral_limit': d_limit,
+            'dihedral_top_out': d_top_out,
+            'dihedral_origin_id': d_origin,
+            'dihedral_alt_ideals': d_alt,
+            'chirality_iseqs': c_iseqs,
+            'chirality_ideal': c_ideal,
+            'chirality_weight': c_weight,
+            'chirality_both_signs': c_both,
+            'chirality_origin_id': c_origin,
+            'planarity_iseqs': p_iseqs,
+            'planarity_weights': p_weights,
+            'planarity_origin_id': p_origin,
+        })
+    return out
 
 
 def score_from_restraints(definition, data, owned):
@@ -787,9 +1185,131 @@ def score_from_restraints(definition, data, owned):
         for j in a_out_idx
     ]
 
+    # Dihedrals (v33)
+    d_iseqs = data.get('dihedral_iseqs', np.empty((0, 4), dtype=np.int32))
+    if len(d_iseqs):
+        d_ideal = data['dihedral_ideal']
+        d_weight = data['dihedral_weight']
+        d_period = data['dihedral_periodicity']
+        d_slack = data['dihedral_slack']
+        d_limit = data['dihedral_limit']
+        d_top_out = data['dihedral_top_out']
+        d_origin = data['dihedral_origin_id']
+        d_alt = data['dihedral_alt_ideals']
+
+        d_noh = ~is_h[d_iseqs].any(axis=1)
+        d_owned = atom_owned[d_iseqs[:, 0]]
+        d_total_mask = d_noh & d_owned
+
+        d_model, _, _, d_score = eval_dihedrals_jax(
+            xyz, d_iseqs, d_ideal, d_weight, d_period, d_slack, d_limit, d_top_out, d_alt
+        )
+        d_out_mask = d_total_mask & (d_origin == V33_OUTLIER_ORIGIN_ID) & (d_score > V33_CUTOFF)
+        d_out_idx = np.flatnonzero(d_out_mask)
+        if d_out_idx.size:
+            d_out_idx = d_out_idx[np.argsort(-d_score[d_out_idx], kind='stable')]
+        d_outliers = [
+            (
+                atom_tuples[int(d_iseqs[j, 0])],
+                atom_tuples[int(d_iseqs[j, 1])],
+                atom_tuples[int(d_iseqs[j, 2])],
+                atom_tuples[int(d_iseqs[j, 3])],
+                float(d_model[j]),
+                float(d_ideal[j]),
+                float(d_score[j]),
+            )
+            for j in d_out_idx
+        ]
+        d_total = int(d_total_mask.sum())
+    else:
+        d_total, d_outliers = 0, []
+
+    # Chiralities (v33)
+    c_iseqs = data.get('chirality_iseqs', np.empty((0, 4), dtype=np.int32))
+    if len(c_iseqs):
+        c_ideal = data['chirality_ideal']
+        c_weight = data['chirality_weight']
+        c_both = data['chirality_both_signs']
+        c_origin = data['chirality_origin_id']
+
+        c_noh = ~is_h[c_iseqs].any(axis=1)
+        c_owned = atom_owned[c_iseqs[:, 0]]
+        c_total_mask = c_noh & c_owned
+
+        c_model, _, _, c_score = eval_chiralities_jax(xyz, c_iseqs, c_ideal, c_weight, c_both)
+        c_out_mask = c_total_mask & (c_origin == V33_OUTLIER_ORIGIN_ID) & (c_score > V33_CUTOFF)
+        c_out_idx = np.flatnonzero(c_out_mask)
+        if c_out_idx.size:
+            c_out_idx = c_out_idx[np.argsort(-c_score[c_out_idx], kind='stable')]
+        c_outliers = [
+            (
+                atom_tuples[int(c_iseqs[j, 0])],
+                atom_tuples[int(c_iseqs[j, 1])],
+                atom_tuples[int(c_iseqs[j, 2])],
+                atom_tuples[int(c_iseqs[j, 3])],
+                float(c_model[j]),
+                float(c_ideal[j]),
+                float(c_score[j]),
+            )
+            for j in c_out_idx
+        ]
+        c_total = int(c_total_mask.sum())
+    else:
+        c_total, c_outliers = 0, []
+
+    # Planarities (v33)
+    # Matching shared_planarity_proxy_select (~hd): strip H atoms from each plane
+    # and keep planes with > 3 non-H atoms.
+    p_iseqs_raw = data.get('planarity_iseqs', np.empty((0, 4), dtype=np.int32))
+    if len(p_iseqs_raw):
+        p_weights_raw = data['planarity_weights']
+        if is_h.any():
+            valid_noh = (p_iseqs_raw >= 0) & (~is_h[np.maximum(p_iseqs_raw, 0)])
+            counts_noh = valid_noh.sum(axis=1)
+            keep_planes = counts_noh > 3
+            p_iseqs_sub = p_iseqs_raw[keep_planes]
+            p_weights_sub = p_weights_raw[keep_planes]
+            valid_sub = valid_noh[keep_planes]
+            n_keep = len(p_iseqs_sub)
+            m_cols = p_iseqs_raw.shape[1]
+            p_iseqs = np.full((n_keep, m_cols), -1, dtype=np.int32)
+            p_weights = np.zeros((n_keep, m_cols), dtype=np.float64)
+            for j in range(n_keep):
+                v_j = valid_sub[j]
+                k_j = int(v_j.sum())
+                p_iseqs[j, :k_j] = p_iseqs_sub[j, v_j]
+                p_weights[j, :k_j] = p_weights_sub[j, v_j]
+        else:
+            valid_raw = (p_iseqs_raw >= 0).sum(axis=1) > 3
+            p_iseqs = p_iseqs_raw[valid_raw]
+            p_weights = p_weights_raw[valid_raw]
+
+        if len(p_iseqs):
+            p_owned = atom_owned[p_iseqs[:, 0]]
+            p_total = int(p_owned.sum())
+            p_rms, p_dmax, _, p_score = eval_planarities_jax(xyz, p_iseqs, p_weights)
+            p_out_mask = p_owned & (p_score > V33_CUTOFF)
+            p_out_idx = np.flatnonzero(p_out_mask)
+            if p_out_idx.size:
+                p_out_idx = p_out_idx[np.argsort(-p_score[p_out_idx], kind='stable')]
+            p_outliers = []
+            for j in p_out_idx:
+                row_iseqs = p_iseqs[j]
+                atoms_j = tuple(atom_tuples[int(i)] for i in row_iseqs if i >= 0)
+                p_outliers.append(
+                    atoms_j + (float(p_rms[j]), float(p_dmax[j]), float(p_score[j]))
+                )
+        else:
+            p_total, p_outliers = 0, []
+    else:
+        p_total, p_outliers = 0, []
+
     return {
         'bonds': {'total': int(b_total_mask.sum()), 'outliers': b_outliers},
         'angles': {'total': int(a_total_mask.sum()), 'outliers': a_outliers},
+        'dihedrals': {'total': d_total, 'outliers': d_outliers},
+        'chiralities': {'total': c_total, 'outliers': c_outliers},
+        'planarities': {'total': p_total, 'outliers': p_outliers},
     }
 
 

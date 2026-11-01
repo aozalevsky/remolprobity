@@ -214,3 +214,35 @@ def get_tables():
         "box_valid": jnp.asarray(box_valid, dtype=jnp.bool_),
     }
     return _TABLES_CACHE
+
+
+_CABLAM_CACHE = None
+DEFAULT_CABLAM_NPZ_PATH = os.path.expanduser("~/.cache/remolprobity/jax_cablam.npz")
+
+
+def get_cablam_tables():
+    """Load and cache static CaBLAM 3D NDimTables and amino-acid class sets."""
+    global _CABLAM_CACHE
+    if _CABLAM_CACHE is not None:
+        return _CABLAM_CACHE
+
+    npz_path = os.environ.get("REMOLPROBITY_CABLAM_NPZ", DEFAULT_CABLAM_NPZ_PATH)
+    data = np.load(npz_path, allow_pickle=False)
+    common_aa = frozenset(str(x) for x in data["common_aa"])
+    mod_aa = frozenset(str(x) for x in data["mod_aa"])
+    d_aa = frozenset(str(x) for x in data["d_aa"])
+    rna_dna = frozenset(str(x) for x in data["rna_dna"]) if "rna_dna" in data else frozenset()
+    mod_rna_dna = frozenset(str(x) for x in data["mod_rna_dna"]) if "mod_rna_dna" in data else frozenset()
+    d_to_l = json.loads(str(data["d_to_l_json"])) if "d_to_l_json" in data else {}
+    _CABLAM_CACHE = {
+        "pep_tables": jnp.asarray(data["pep_tables"], dtype=jnp.float64),
+        "ca_tables": jnp.asarray(data["ca_tables"], dtype=jnp.float64),
+        "common_aa": common_aa,
+        "mod_aa": mod_aa,
+        "d_aa": d_aa,
+        "all_aa": common_aa | mod_aa | d_aa,
+        "all_na": rna_dna | mod_rna_dna,
+        "d_to_l": d_to_l,
+    }
+    return _CABLAM_CACHE
+

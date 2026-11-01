@@ -22,6 +22,7 @@ from .jax_tables import (
     RAMA_TRANSPRO,
     RAMA_TYPE_NAMES,
     SYM_AA,
+    get_cablam_tables,
     get_tables,
 )
 
@@ -627,3 +628,660 @@ def rotamers(hierarchy):
             float(score_np[i]),
         ))
     return out
+
+
+def _rotate_point_around_axis_jax(axis_p1, axis_p2, point, angle_deg):
+    """
+    Exact vectorized replica of scitbx::math::rotate_point_around_axis
+    (scitbx/math/rotate_around_axis.h:58-97).
+    axis_p1, axis_p2, point: (N, 3) float64 arrays.
+    angle_deg: (N,) float64 array in degrees.
+    """
+    angle_rad = angle_deg * (jnp.pi / 180.0)
+    l = axis_p2 - axis_p1
+    dlsq = jnp.sum(l * l, axis=-1, keepdims=True)
+    safe_dlsq = jnp.where(dlsq == 0.0, 1.0, dlsq)
+    dl = jnp.sqrt(safe_dlsq)
+    ca = jnp.cos(angle_rad)[:, None]
+    dsa = jnp.sin(angle_rad)[:, None] / dl
+    oca = (1.0 - ca) / safe_dlsq
+    m = point - axis_p1
+    l_dot_m = jnp.sum(l * m, axis=-1, keepdims=True)
+    l_cross_m = jnp.cross(l, m)
+    return axis_p1 + m * ca + l * (l_dot_m * oca) + l_cross_m * dsa
+
+
+def _construct_fourth_jax(res0, res1, res2, dist, angle, dihedral):
+    """
+    Vectorized replica of mmtbx.validation.cbetadev.construct_fourth
+    (cbetadev.py:322-358).
+    """
+    a = res2 - res1
+    b = res0 - res1
+    c = jnp.cross(a, b)
+    cmag = jnp.sqrt(jnp.sum(c * c, axis=-1, keepdims=True))
+    c = jnp.where(cmag > 1e-6, c * (dist[:, None] / jnp.where(cmag > 1e-6, cmag, 1.0)), c)
+    d = c + res2
+    new_d = _rotate_point_around_axis_jax(res1, res2, d, dihedral - 90.0)
+    a2 = new_d - res2
+    b2 = res1 - res2
+    c2 = jnp.cross(a2, b2)
+    cmag2 = jnp.sqrt(jnp.sum(c2 * c2, axis=-1, keepdims=True))
+    c2 = jnp.where(cmag2 > 1e-6, c2 * (dist[:, None] / jnp.where(cmag2 > 1e-6, cmag2, 1.0)), c2)
+    b_axis = c2 + res2
+    return _rotate_point_around_axis_jax(res2, b_axis, new_d, 90.0 - angle)
+
+
+@jax.jit
+def _cbeta_batch_kernel(res_n, res_ca, res_c, res_cb, res_type, is_common_aa, is_d_aa):
+    """
+    Vectorized GPU kernel for C-beta deviation and dihedral_NABB
+    (mmtbx/validation/cbetadev.py:216-358).
+    res_type: 0=default, 1=ALA/DAL, 2=PRO/DPR, 3=VAL/THR/ILE/DVA/DTH/DIL.
+    """
+    # Chiral volume at CA: (N - CA) . ((CB - CA) x (C - CA))
+    d01 = res_n - res_ca
+    d02 = res_cb - res_ca
+    d03 = res_c - res_ca
+    chiral_vol = jnp.sum(d01 * jnp.cross(d02, d03), axis=-1)
+
+    dist_lut = jnp.array([1.530, 1.536, 1.530, 1.540], dtype=jnp.float64)
+    ang_cab_lut = jnp.array([110.1, 110.1, 112.2, 109.1], dtype=jnp.float64)
+    dih_ncab_lut = jnp.array([122.8, 122.9, 115.1, 123.4], dtype=jnp.float64)
+    ang_nab_lut = jnp.array([110.5, 110.6, 103.0, 111.5], dtype=jnp.float64)
+    dih_cnab_lut = jnp.array([-122.6, -122.6, -120.7, -122.0], dtype=jnp.float64)
+
+    dist = dist_lut[res_type]
+    ang_cab = ang_cab_lut[res_type]
+    dih_ncab = dih_ncab_lut[res_type]
+    ang_nab = ang_nab_lut[res_type]
+    dih_cnab = dih_cnab_lut[res_type]
+
+    flip_d = (~is_common_aa) & (is_d_aa | (chiral_vol > 0.0))
+    dih_ncab = jnp.where(flip_d, -dih_ncab, dih_ncab)
+    dih_cnab = jnp.where(flip_d, -dih_cnab, dih_cnab)
+
+    beta_ncab = _construct_fourth_jax(res_n, res_c, res_ca, dist, ang_cab, dih_ncab)
+    beta_cnab = _construct_fourth_jax(res_c, res_n, res_ca, dist, ang_nab, dih_cnab)
+    betaxyz = 0.5 * (beta_ncab + beta_cnab)
+
+    diff_ca = betaxyz - res_ca
+    betadist = jnp.sqrt(jnp.sum(diff_ca * diff_ca, axis=-1))
+    safe_bdist = jnp.where(betadist > 0.0, betadist, 1.0)
+    betaxyz = jnp.where(
+        (betadist > 0.0)[:, None],
+        res_ca + diff_ca * (dist / safe_bdist)[:, None],
+        betaxyz,
+    )
+
+    dev_vec = res_cb - betaxyz
+    deviation = jnp.sqrt(jnp.sum(dev_vec * dev_vec, axis=-1))
+    dihedral_nabb = dihedral_angles_jax(res_n, res_ca, betaxyz, res_cb)
+    return deviation, dihedral_nabb
+
+
+def cbeta(hierarchy):
+    """
+    Every cbetadev result as (chain, resid, resname, altloc, deviation, dihedral NABB, occupancy).
+    Vectorized JAX/GPU implementation bit-exact with mmtbx.validation.cbetadev.
+    """
+    h = _ensure_hierarchy(hierarchy)
+    cab_tables = get_cablam_tables()
+    common_aa = cab_tables["common_aa"]
+    d_aa = cab_tables["d_aa"]
+
+    model = h.models()[0]
+    meta = []
+    n_list, ca_list, c_list, cb_list = [], [], [], []
+    rtype_list, common_list, daa_list = [], [], []
+
+    for ch in model.chains():
+        cid_strip = ch.id.strip()
+        for rg in ch.residue_groups():
+            resid_str = residue_id(rg.resseq, rg.icode)
+            for i_cf, cf in enumerate(rg.conformers()):
+                for res in cf.residues():
+                    rn_strip = res.resname.strip()
+                    if rn_strip == "GLY":
+                        continue
+                    is_alt_conf = False
+                    rel = {}
+                    for a in res.atoms():
+                        if a.name in (" CA ", " N  ", " C  ", " CB "):
+                            rel[a.name] = a
+                            ag = a.parent()
+                            if ag is not None and len(ag.altloc) != 0:
+                                is_alt_conf = True
+                    if (i_cf == 0 or is_alt_conf) and len(rel) == 4:
+                        res_ca = rel[" CA "]
+                        res_n = rel[" N  "]
+                        res_c = rel[" C  "]
+                        res_cb = rel[" CB "]
+                        altchar = cf.altloc.strip() if is_alt_conf else ""
+                        if rn_strip in ("ALA", "DAL"):
+                            rt = 1
+                        elif rn_strip in ("PRO", "DPR"):
+                            rt = 2
+                        elif rn_strip in ("VAL", "THR", "ILE", "DVA", "DTH", "DIL"):
+                            rt = 3
+                        else:
+                            rt = 0
+                        n_list.append(res_n.xyz)
+                        ca_list.append(res_ca.xyz)
+                        c_list.append(res_c.xyz)
+                        cb_list.append(res_cb.xyz)
+                        rtype_list.append(rt)
+                        common_list.append(rn_strip in common_aa)
+                        daa_list.append(rn_strip in d_aa)
+                        meta.append((cid_strip, resid_str, rn_strip, altchar, float(res_cb.occ)))
+
+    if not meta:
+        return []
+
+    n_items = len(meta)
+    bucket_n = _next_bucket(n_items)
+    pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), bucket_n))
+
+    dev_arr, dih_arr = _cbeta_batch_kernel(
+        pad(n_list, np.float64),
+        pad(ca_list, np.float64),
+        pad(c_list, np.float64),
+        pad(cb_list, np.float64),
+        pad(rtype_list, np.int32),
+        pad(common_list, np.bool_),
+        pad(daa_list, np.bool_),
+    )
+    dev_np = np.asarray(dev_arr[:n_items], dtype=np.float64)
+    dih_np = np.asarray(dih_arr[:n_items], dtype=np.float64)
+
+    out = []
+    for i, (cid_strip, resid_str, rn_strip, altchar, occ) in enumerate(meta):
+        out.append((
+            cid_strip,
+            resid_str,
+            rn_strip,
+            altchar,
+            float(dev_np[i]),
+            float(dih_np[i]),
+            occ,
+        ))
+    return out
+
+
+def _local_altloc_from_atoms(atoms):
+    altloc = ""
+    for a in atoms:
+        ag = a.parent()
+        if ag is not None and ag.altloc != "":
+            altloc = ag.altloc
+    return altloc.strip()
+
+
+def omegas(hierarchy):
+    """
+    Every peptide omegalyze measures, in every conformer, before its filter:
+    (chain, resid, resname, altloc, previous resid, previous altloc, omega,
+    type, conformer altloc, the peptide's altloc).
+    Vectorized JAX/GPU implementation bit-exact with remolprobity.residues.omegas.
+    """
+    h = _ensure_hierarchy(hierarchy)
+    all_aa = get_cablam_tables()["all_aa"]
+    model = h.models()[0]
+
+    meta = []
+    ca0_list, c0_list, n1_list, ca1_list = [], [], [], []
+
+    for ch in model.chains():
+        cid_strip = ch.id.strip()
+        bb_ch = _select_backbone_chain(ch)
+        for conf in bb_ch.conformers():
+            conf_alt = conf.altloc
+            two = []
+            for res in conf.residues():
+                rn = res.resname.strip()
+                if rn not in all_aa:
+                    continue
+                if two:
+                    prev_c = two[-1].find_atom_by(" C  ")
+                    curr_n = res.find_atom_by(" N  ")
+                    if prev_c is None or curr_n is None:
+                        two = [res]
+                        continue
+                    dx = prev_c.xyz[0] - curr_n.xyz[0]
+                    dy = prev_c.xyz[1] - curr_n.xyz[1]
+                    dz = prev_c.xyz[2] - curr_n.xyz[2]
+                    if dx * dx + dy * dy + dz * dz >= 4.0:
+                        two = [res]
+                        continue
+                two.append(res)
+                if len(two) > 2:
+                    two.pop(0)
+                if len(two) < 2:
+                    continue
+
+                r0, r1 = two[0], two[1]
+                prev_ca = prev_c = this_n = this_ca = None
+                for a in r0.atoms():
+                    if a.name == " CA ":
+                        prev_ca = a
+                    elif a.name == " C  ":
+                        prev_c = a
+                for a in r1.atoms():
+                    if a.name == " N  ":
+                        this_n = a
+                    elif a.name == " CA ":
+                        this_ca = a
+                if prev_ca is None or prev_c is None or this_n is None or this_ca is None:
+                    continue
+
+                atoms = [prev_ca, prev_c, this_n, this_ca]
+                ca0_list.append(prev_ca.xyz)
+                c0_list.append(prev_c.xyz)
+                n1_list.append(this_n.xyz)
+                ca1_list.append(this_ca.xyz)
+                meta.append((
+                    cid_strip,
+                    residue_id(r1.resseq, r1.icode),
+                    r1.resname.strip(),
+                    _local_altloc_from_atoms(atoms[2:]),
+                    residue_id(r0.resseq, r0.icode),
+                    _local_altloc_from_atoms(atoms[0:2]),
+                    conf_alt,
+                    _local_altloc_from_atoms(atoms),
+                ))
+
+    if not meta:
+        return []
+
+    n_items = len(meta)
+    bucket_n = _next_bucket(n_items)
+    pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), bucket_n))
+
+    omega_arr = dihedral_angles_jax(
+        pad(ca0_list, np.float64),
+        pad(c0_list, np.float64),
+        pad(n1_list, np.float64),
+        pad(ca1_list, np.float64),
+    )
+    omega_np = np.asarray(omega_arr[:n_items], dtype=np.float64)
+
+    out = []
+    for i, (cid_strip, res1_id, rn1, alt1, res0_id, alt0, conf_alt, pep_alt) in enumerate(meta):
+        om = float(omega_np[i])
+        if -30.0 < om < 30.0:
+            om_type = "Cis"
+        elif om < -150.0 or om > 150.0:
+            om_type = "Trans"
+        else:
+            om_type = "Twisted"
+        out.append((cid_strip, res1_id, rn1, alt1, res0_id, alt0, om, om_type, conf_alt, pep_alt))
+    return out
+
+
+def _ndt_interp_3d_jax(tables_3d, t_idx, x0, x1, x2, min2, nbins2):
+    """
+    Exact vectorized replica of NDimTable.valueAt for 3D CaBLAM tables
+    (n_dim_table.py:165-196).
+    tables_3d: (4, 120, 120, N2) float64 array where N2 is 120 (pep) or 60 (CA).
+    """
+    coords = jnp.stack([x0, x1, x2], axis=-1)
+    min_v = jnp.array([-180.0, -180.0, min2], dtype=jnp.float64)
+    w_b = jnp.array([3.0, 3.0, 3.0], dtype=jnp.float64)
+    n_b = jnp.array([120, 120, nbins2], dtype=jnp.int32)
+    n_b_f = n_b.astype(jnp.float64)
+
+    va_home = jnp.minimum(jnp.floor((coords - min_v) / w_b), n_b_f - 1.0).astype(jnp.int32)
+    va_home_ctr = min_v + w_b * (va_home.astype(jnp.float64) + 0.5)
+    va_neighbor = jnp.where(coords < va_home_ctr, va_home - 1, va_home + 1)
+    va_contrib = jnp.abs((coords - va_home_ctr) / w_b)
+
+    # All 3 dimensions have doWrap=True in CaBLAM tables
+    def _wrap_lim(b_val, nb_d):
+        w = jnp.mod(b_val, nb_d)
+        w = jnp.where(w < 0, w + nb_d, w)
+        return jnp.clip(w, 0, nb_d - 1).astype(jnp.int32)
+
+    h0 = _wrap_lim(va_home[:, 0], 120)
+    h1 = _wrap_lim(va_home[:, 1], 120)
+    h2 = _wrap_lim(va_home[:, 2], nbins2)
+    n0 = _wrap_lim(va_neighbor[:, 0], 120)
+    n1 = _wrap_lim(va_neighbor[:, 1], 120)
+    n2 = _wrap_lim(va_neighbor[:, 2], nbins2)
+
+    c0 = va_contrib[:, 0]
+    c1 = va_contrib[:, 1]
+    c2 = va_contrib[:, 2]
+
+    res = jnp.zeros(x0.shape[0], dtype=jnp.float64)
+    for b_idx in range(8):
+        i0 = h0 if (b_idx & 1) == 0 else n0
+        i1 = h1 if (b_idx & 2) == 0 else n1
+        i2 = h2 if (b_idx & 4) == 0 else n2
+        w0 = (1.0 - c0) if (b_idx & 1) == 0 else c0
+        w1 = (1.0 - c1) if (b_idx & 2) == 0 else c1
+        w2 = (1.0 - c2) if (b_idx & 4) == 0 else c2
+        res = res + (w0 * w1 * w2) * tables_3d[t_idx, i0, i1, i2]
+    return res
+
+
+@jax.jit
+def _cablam_geom_batch_kernel(
+    ca0, ca1, ca2, ca3, ca4, o1, o2, c1, n2,
+    has_ca_3, has_mu_in, has_mu_out, has_nu_in, has_omega
+):
+    """
+    Vectorized GPU kernel for CaBLAM virtual angles/dihedrals (mu_in, mu_out,
+    nu, ca_virtual, omega) matching mmtbx.validation.cablam.cablam_math.
+    """
+    mu_in = dihedral_angles_jax(ca0, ca1, ca2, ca3)
+    mu_out = dihedral_angles_jax(ca1, ca2, ca3, ca4)
+
+    # ca_virtual = scitbx::math::angle(ca1, ca2, ca3)
+    v1 = ca1 - ca2
+    v3 = ca3 - ca2
+    n1_sq = jnp.sum(v1 * v1, axis=-1)
+    n3_sq = jnp.sum(v3 * v3, axis=-1)
+    denom = jnp.sqrt(n1_sq * n3_sq)
+    safe_denom = jnp.where(denom > 0.0, denom, 1.0)
+    cos_ang = jnp.clip(jnp.sum(v1 * v3, axis=-1) / safe_denom, -1.0, 1.0)
+    ca_virt = jnp.arccos(cos_ang) * (180.0 / jnp.pi)
+
+    # perptersect(a1, a2, b1): projection of b1 onto line a1..a2
+    def _perptersect(a1, a2, b1):
+        u = a2 - a1
+        u_sq = jnp.sum(u * u, axis=-1, keepdims=True)
+        valid = (u_sq[:, 0] > 0.0)
+        safe_u_sq = jnp.where(u_sq > 0.0, u_sq, 1.0)
+        t = jnp.sum((b1 - a1) * u, axis=-1, keepdims=True) / safe_u_sq
+        return a1 + t * u, valid
+
+    x1, v_x1 = _perptersect(ca1, ca2, o1)
+    x2, v_x2 = _perptersect(ca2, ca3, o2)
+    valid_nu = has_nu_in & v_x1 & v_x2
+    nu = dihedral_angles_jax(o1, x1, x2, o2)
+    omega = dihedral_angles_jax(ca1, c1, n2, ca2)
+
+    return mu_in, mu_out, nu, ca_virt, omega, valid_nu
+
+
+@jax.jit
+def _cablam_eval_batch_kernel(mu_in, mu_out, nu, ca_virt, t_idx, pep_tables, ca_tables):
+    """Vectorized 3D trilinear contour evaluation for CaBLAM and CA-geom."""
+    cab_score = _ndt_interp_3d_jax(pep_tables, t_idx, mu_in, mu_out, nu, -180.0, 120)
+    ca_score = _ndt_interp_3d_jax(ca_tables, t_idx, mu_in, mu_out, ca_virt, 0.0, 60)
+    return cab_score, ca_score
+
+
+def cablam(hierarchy, owned):
+    """
+    CaBLAM in each chain object of hierarchy on its own, as cablamalyze
+    makes it: (records, classes).
+    Vectorized JAX/GPU implementation bit-exact with remolprobity.residues.cablam.
+    """
+    h = _ensure_hierarchy(hierarchy)
+    cab_tables = get_cablam_tables()
+    common_aa = cab_tables["common_aa"]
+    all_aa = cab_tables["all_aa"]
+    all_na = cab_tables["all_na"]
+    d_to_l = cab_tables["d_to_l"]
+
+    records, classes = [], []
+    model = h.models()[0]
+    model_id = model.id
+
+    # First pass: collect classes and build per-chain, per-conformer linked residue nodes
+    chains_work = []
+    geom_nodes = []
+    ca0_l, ca1_l, ca2_l, ca3_l, ca4_l = [], [], [], [], []
+    o1_l, o2_l, c1_l, n2_l = [], [], [], []
+    has_ca3_l, has_mu_in_l, has_mu_out_l, has_nu_l, has_om_l = [], [], [], [], []
+
+    z0 = (0.0, 0.0, 0.0)
+    u1, u2, u3 = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)
+
+    for chain in model.chains():
+        cid = chain.id.strip()
+        keys = [(cid, residue_id(rg.resseq, rg.icode)) for rg in chain.residue_groups()]
+        mine = [owned(*k) for k in keys]
+        if not any(mine):
+            continue
+        for rg, k, own in zip(chain.residue_groups(), keys, mine):
+            if not own:
+                continue
+            ag = rg.atom_groups()[0]
+            rn = ag.resname.strip().upper()
+            if not rn:
+                rn = None
+            elif rn in d_to_l:
+                rn = d_to_l[rn]
+            elif len(ag.atoms()) == 1 and rn in ("A", "C", "G", "U", "DA", "DC", "DG", "DT", "T"):
+                an = ag.atoms()[0].name.strip()
+                if an not in ("P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "O2'", "C1'"):
+                    rn = None
+            is_aa = int(rn in all_aa) if rn is not None else 0
+            is_na = int(rn in all_na) if rn is not None else 0
+            classes.append(k + (int(rn != "HOH"), is_aa, is_na, int(rn == "UNK")))
+
+        conformer_ids = []
+        results_by_conformer = {}
+        all_keys = []
+        all_keys_set = set()
+
+        for conf in chain.conformers():
+            cname = conf.altloc.strip()
+            if cname == "":
+                cname = " "
+            if cname not in conformer_ids:
+                conformer_ids.append(cname)
+            cur_conf_res = {}
+            results_by_conformer[cname] = cur_conf_res
+            prev_node = None
+
+            for res in conf.residues():
+                sid = f"{model_id}{chain.id.rjust(2)}{res.resseq}{res.icode}"
+                if sid not in all_keys_set:
+                    all_keys_set.add(sid)
+                    all_keys.append(sid)
+
+                ca = res.find_atom_by(" CA ")
+                c = res.find_atom_by(" C  ")
+                n = res.find_atom_by(" N  ")
+                o = res.find_atom_by(" O  ")
+                has_ca = ca is not None
+                has_mc = has_ca and (c is not None) and (n is not None) and (o is not None)
+
+                node = {
+                    "chain_id": chain.id,
+                    "resseq": res.resseq,
+                    "icode": res.icode,
+                    "resname": res.resname,
+                    "altloc": conf.altloc.strip(),
+                    "has_ca": has_ca,
+                    "has_mc": has_mc,
+                    "ca": ca.xyz if ca is not None else None,
+                    "c": c.xyz if c is not None else None,
+                    "n": n.xyz if n is not None else None,
+                    "o": o.xyz if o is not None else None,
+                    "prev": None,
+                    "next": None,
+                    "mu_in": None,
+                    "mu_out": None,
+                    "nu": None,
+                    "ca_virt": None,
+                    "omega": None,
+                }
+                if prev_node is not None and prev_node["has_ca"] and has_ca:
+                    if prev_node["has_mc"] and has_mc:
+                        p_c = prev_node["c"]
+                        c_n = node["n"]
+                        dx, dy, dz = p_c[0] - c_n[0], p_c[1] - c_n[1], p_c[2] - c_n[2]
+                        linked = (dx * dx + dy * dy + dz * dz) < 4.0
+                    else:
+                        p_ca = prev_node["ca"]
+                        c_ca = node["ca"]
+                        dx, dy, dz = p_ca[0] - c_ca[0], p_ca[1] - c_ca[1], p_ca[2] - c_ca[2]
+                        linked = (dx * dx + dy * dy + dz * dz) < 20.25
+                    if linked:
+                        prev_node["next"] = node
+                        node["prev"] = prev_node
+                prev_node = node
+                if sid not in cur_conf_res:
+                    cur_conf_res[sid] = node
+
+        # Collect nodes that need geometry calculation
+        for cname in conformer_ids:
+            for sid, node in results_by_conformer[cname].items():
+                p1 = node["prev"]
+                n1 = node["next"]
+                has_ca3 = node["has_ca"] and (p1 is not None and p1["has_ca"]) and (n1 is not None and n1["has_ca"])
+                has_mu_in = has_ca3 and (p1["prev"] is not None and p1["prev"]["has_ca"])
+                has_mu_out = has_ca3 and (n1["next"] is not None and n1["next"]["has_ca"])
+                has_nu = node["has_mc"] and (p1 is not None and p1["has_mc"]) and (n1 is not None and n1["has_mc"])
+                has_om = node["has_mc"] and (p1 is not None and p1["has_mc"])
+                if not (has_ca3 or has_nu or has_om):
+                    continue
+                geom_nodes.append(node)
+                ca0_l.append(p1["prev"]["ca"] if has_mu_in else u1)
+                ca1_l.append(p1["ca"] if (has_ca3 or has_nu or has_om) else z0)
+                ca2_l.append(node["ca"] if (has_ca3 or has_nu or has_om) else u2)
+                ca3_l.append(n1["ca"] if (has_ca3 or has_nu) else u3)
+                ca4_l.append(n1["next"]["ca"] if has_mu_out else u1)
+                o1_l.append(p1["o"] if has_nu else u1)
+                o2_l.append(node["o"] if has_nu else u3)
+                c1_l.append(p1["c"] if has_om else u1)
+                n2_l.append(node["n"] if has_om else u3)
+                has_ca3_l.append(has_ca3)
+                has_mu_in_l.append(has_mu_in)
+                has_mu_out_l.append(has_mu_out)
+                has_nu_l.append(has_nu)
+                has_om_l.append(has_om)
+
+        chains_work.append((conformer_ids, results_by_conformer, all_keys))
+
+    if geom_nodes:
+        n_g = len(geom_nodes)
+        b_g = _next_bucket(n_g)
+        pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), b_g))
+        mu_in_a, mu_out_a, nu_a, ca_v_a, om_a, val_nu_a = _cablam_geom_batch_kernel(
+            pad(ca0_l, np.float64),
+            pad(ca1_l, np.float64),
+            pad(ca2_l, np.float64),
+            pad(ca3_l, np.float64),
+            pad(ca4_l, np.float64),
+            pad(o1_l, np.float64),
+            pad(o2_l, np.float64),
+            pad(c1_l, np.float64),
+            pad(n2_l, np.float64),
+            pad(has_ca3_l, np.bool_),
+            pad(has_mu_in_l, np.bool_),
+            pad(has_mu_out_l, np.bool_),
+            pad(has_nu_l, np.bool_),
+            pad(has_om_l, np.bool_),
+        )
+        mu_in_np = np.asarray(mu_in_a[:n_g], dtype=np.float64)
+        mu_out_np = np.asarray(mu_out_a[:n_g], dtype=np.float64)
+        nu_np = np.asarray(nu_a[:n_g], dtype=np.float64)
+        ca_v_np = np.asarray(ca_v_a[:n_g], dtype=np.float64)
+        om_np = np.asarray(om_a[:n_g], dtype=np.float64)
+        val_nu_np = np.asarray(val_nu_a[:n_g], dtype=bool)
+
+        for i, node in enumerate(geom_nodes):
+            if has_ca3_l[i]:
+                node["ca_virt"] = float(ca_v_np[i])
+            if has_mu_in_l[i]:
+                node["mu_in"] = float(mu_in_np[i])
+            if has_mu_out_l[i]:
+                node["mu_out"] = float(mu_out_np[i])
+            if val_nu_np[i]:
+                node["nu"] = float(nu_np[i])
+            if has_om_l[i]:
+                node["omega"] = float(om_np[i])
+
+    # Merge conformers per chain (make_single_results_object) and collect owned CA nodes
+    owned_nodes = []
+    eval_nodes = []
+    ev_mu_in, ev_mu_out, ev_nu, ev_ca_v, ev_tidx = [], [], [], [], []
+
+    for conformer_ids, results_by_conformer, all_keys in chains_work:
+        chain_results = []
+        for sid in all_keys:
+            res_node = None
+            found_idx = 0
+            for idx, cname in enumerate(conformer_ids):
+                if sid in results_by_conformer[cname]:
+                    res_node = results_by_conformer[cname][sid]
+                    found_idx = idx
+                    break
+            found_meaningful_alt = False
+            m_base = (res_node["mu_in"], res_node["mu_out"], res_node["nu"])
+            for other_cname in conformer_ids[found_idx + 1 :]:
+                if sid in results_by_conformer[other_cname]:
+                    other_node = results_by_conformer[other_cname][sid]
+                    m_other = (other_node["mu_in"], other_node["mu_out"], other_node["nu"])
+                    if m_base != m_other:
+                        chain_results.append(other_node)
+                        found_meaningful_alt = True
+            if not found_meaningful_alt:
+                res_node["altloc"] = ""
+            chain_results.append(res_node)
+
+        chain_results.sort(
+            key=lambda r: (r["chain_id"].rjust(2), _hy36decode(r["resseq"]), r["icode"], r["altloc"])
+        )
+        for r in chain_results:
+            key = (r["chain_id"].strip(), residue_id(r["resseq"], r["icode"]))
+            if r["has_ca"] and owned(*key):
+                r["key"] = key
+                r["cablam_score"] = None
+                r["ca_geom_score"] = None
+                owned_nodes.append(r)
+                rn_up = r["resname"].strip().upper()
+                if rn_up in common_aa and r["mu_in"] is not None and r["mu_out"] is not None:
+                    if r["nu"] is not None or r["ca_virt"] is not None:
+                        if rn_up == "GLY":
+                            t_i = 1
+                        elif rn_up == "PRO":
+                            om = r["omega"]
+                            t_i = 3 if (om is not None and -90.0 <= om <= 90.0) else 2
+                        else:
+                            t_i = 0
+                        eval_nodes.append(r)
+                        ev_mu_in.append(r["mu_in"])
+                        ev_mu_out.append(r["mu_out"])
+                        ev_nu.append(r["nu"] if r["nu"] is not None else 0.0)
+                        ev_ca_v.append(r["ca_virt"] if r["ca_virt"] is not None else 0.0)
+                        ev_tidx.append(t_i)
+
+    if eval_nodes:
+        n_e = len(eval_nodes)
+        b_e = _next_bucket(n_e)
+        pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), b_e))
+        cab_a, ca_a = _cablam_eval_batch_kernel(
+            pad(ev_mu_in, np.float64),
+            pad(ev_mu_out, np.float64),
+            pad(ev_nu, np.float64),
+            pad(ev_ca_v, np.float64),
+            pad(ev_tidx, np.int32),
+            cab_tables["pep_tables"],
+            cab_tables["ca_tables"],
+        )
+        cab_np = np.asarray(cab_a[:n_e], dtype=np.float64)
+        ca_np = np.asarray(ca_a[:n_e], dtype=np.float64)
+        for i, r in enumerate(eval_nodes):
+            if r["nu"] is not None:
+                r["cablam_score"] = float(cab_np[i])
+            if r["ca_virt"] is not None:
+                r["ca_geom_score"] = float(ca_np[i])
+
+    for r in owned_nodes:
+        records.append(
+            r["key"]
+            + (
+                r["resname"].strip(),
+                r["altloc"].strip(),
+                r["cablam_score"],
+                r["ca_geom_score"],
+            )
+        )
+    return records, classes
+

@@ -289,6 +289,61 @@ class JaxResidueGroup:
             rg.append_atom_group(ag.detached_copy())
         return rg
 
+    def conformers(self):
+        return _build_conformers_from_residue_groups(self._parent, (self,))
+
+
+def _build_conformers_from_residue_groups(parent, residue_groups):
+    """Exact replica of conformer::build_from_residue_groups (hierarchy.cpp:1988-2097)."""
+    altlocs = []
+    altloc_indices = {}
+    for rg in residue_groups:
+        for ag in rg._atom_groups:
+            al = ag.altloc
+            if al == "":
+                continue
+            if al not in altloc_indices:
+                altloc_indices[al] = len(altlocs)
+                altlocs.append(al)
+    if not altlocs:
+        altlocs.append("")
+    n_conf = len(altlocs)
+    result = [JaxConformer(al, parent) for al in altlocs]
+    for rg in residue_groups:
+        resnames_by_conf = [[] for _ in range(n_conf)]
+        resname_indices_by_conf = [{} for _ in range(n_conf)]
+        atoms_by_conf_resname = [[] for _ in range(n_conf)]
+        has_altconf_by_conf_resname = [[] for _ in range(n_conf)]
+        for ag in rg._atom_groups:
+            al = ag.altloc
+            is_main = al == ""
+            i_confs = range(n_conf) if is_main else (altloc_indices[al],)
+            rn = ag.resname
+            for ic in i_confs:
+                r_map = resname_indices_by_conf[ic]
+                ir = r_map.get(rn)
+                if ir is None:
+                    ir = r_map[rn] = len(resnames_by_conf[ic])
+                    resnames_by_conf[ic].append(rn)
+                    atoms_by_conf_resname[ic].append([])
+                    has_altconf_by_conf_resname[ic].append(False)
+                atoms_by_conf_resname[ic][ir].extend(ag._atoms)
+                if not is_main:
+                    has_altconf_by_conf_resname[ic][ir] = True
+        for ic in range(n_conf):
+            for ir, rn in enumerate(resnames_by_conf[ic]):
+                res = JaxConformerResidue(
+                    resname=rn,
+                    resseq=rg.resseq,
+                    icode=rg.icode,
+                    link_to_previous=rg.link_to_previous,
+                    is_pure_main_conf=not has_altconf_by_conf_resname[ic][ir],
+                    atoms=atoms_by_conf_resname[ic][ir],
+                    parent=result[ic],
+                )
+                result[ic]._residues.append(res)
+    return result
+
 
 class JaxConformerResidue:
     __slots__ = ("resname", "resseq", "icode", "link_to_previous", "is_pure_main_conf", "_atoms", "_parent")
@@ -430,55 +485,7 @@ class JaxChain:
                     self.merge_residue_groups(primary, rgs_snapshot[idx])
 
     def conformers(self):
-        """Exact replica of conformer::build_from_residue_groups (hierarchy.cpp:1988-2097)."""
-        altlocs = []
-        altloc_indices = {}
-        for rg in self._residue_groups:
-            for ag in rg._atom_groups:
-                al = ag.altloc
-                if al == "":
-                    continue
-                if al not in altloc_indices:
-                    altloc_indices[al] = len(altlocs)
-                    altlocs.append(al)
-        if not altlocs:
-            altlocs.append("")
-        n_conf = len(altlocs)
-        result = [JaxConformer(al, self) for al in altlocs]
-        for rg in self._residue_groups:
-            resnames_by_conf = [[] for _ in range(n_conf)]
-            resname_indices_by_conf = [{} for _ in range(n_conf)]
-            atoms_by_conf_resname = [[] for _ in range(n_conf)]
-            has_altconf_by_conf_resname = [[] for _ in range(n_conf)]
-            for ag in rg._atom_groups:
-                al = ag.altloc
-                is_main = al == ""
-                i_confs = range(n_conf) if is_main else (altloc_indices[al],)
-                rn = ag.resname
-                for ic in i_confs:
-                    r_map = resname_indices_by_conf[ic]
-                    ir = r_map.get(rn)
-                    if ir is None:
-                        ir = r_map[rn] = len(resnames_by_conf[ic])
-                        resnames_by_conf[ic].append(rn)
-                        atoms_by_conf_resname[ic].append([])
-                        has_altconf_by_conf_resname[ic].append(False)
-                    atoms_by_conf_resname[ic][ir].extend(ag._atoms)
-                    if not is_main:
-                        has_altconf_by_conf_resname[ic][ir] = True
-            for ic in range(n_conf):
-                for ir, rn in enumerate(resnames_by_conf[ic]):
-                    res = JaxConformerResidue(
-                        resname=rn,
-                        resseq=rg.resseq,
-                        icode=rg.icode,
-                        link_to_previous=rg.link_to_previous,
-                        is_pure_main_conf=not has_altconf_by_conf_resname[ic][ir],
-                        atoms=atoms_by_conf_resname[ic][ir],
-                        parent=result[ic],
-                    )
-                    result[ic]._residues.append(res)
-        return result
+        return _build_conformers_from_residue_groups(self, self._residue_groups)
 
     def detached_copy(self):
         ch = JaxChain(self.id)
@@ -978,6 +985,7 @@ def _read_pdb_hierarchy(path, check=True, zero_occupancy_as_one=False):
 
 def read_hierarchy(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=False):
     """Read a PDB or mmCIF file into a JaxHierarchy matching iotbx.pdb.input.construct_hierarchy()."""
+    path = os.fspath(path)
     if file_format(path) == "cif":
         return _read_cif_hierarchy(path, check, zero_occupancy_as_one, missing_b_as_zero)
     return _read_pdb_hierarchy(path, check, zero_occupancy_as_one)

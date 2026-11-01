@@ -134,6 +134,7 @@ def parse_args(argv):
     p.add_argument('--block-timeout', type=float)
     p.add_argument('--zero-occupancy-as-one', action='store_true', help='an occupancy of 0, or none, as 1')
     p.add_argument('--missing-b-as-zero', action='store_true', help="a B of '.' or '?' (mmCIF) as 0")
+    p.add_argument('--gpu', action='store_true', help='evaluate residue, geometry, and clash checks on GPU via JAX')
     return p.parse_args(argv)
 
 
@@ -381,7 +382,7 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
                      'occupancy_max': 1.0 if a.zero_occupancy_as_one and not model.occupancy_max
                      else model.occupancy_max,
                      'stretch': {k: int(v) for k, v in zip(model.residues, io.stretches(model))},
-                     'tools': t, 'definitions': definitions, 'margin': a.margin}, f, protocol=4)
+                     'tools': t, 'definitions': definitions, 'margin': a.margin, 'gpu': a.gpu}, f, protocol=4)
     order = sorted(range(plan.n_blocks), key=lambda b: -sizes[b])
     tasks = [{'block': b, 'path': paths[b], 'workdir': work, 'shared': shared} for b in order]
     block_results = schedule.run_tasks(worker.run_block, tasks, nproc, timeout=a.block_timeout,
