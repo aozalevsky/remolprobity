@@ -315,8 +315,271 @@ def _pad_to(arr, target_n):
 
 def _ensure_hierarchy(h_or_path):
     if isinstance(h_or_path, str):
-        return prepare_noh_hierarchy(read_hierarchy(h_or_path))
+        return prepare_noh_hierarchy(read_hierarchy(h_or_path), in_place=True)
     return h_or_path
+
+
+_SLOT_NAMES = (
+    "N", "CA", "C", "O", "CB",
+    "CD", "CD1", "CE", "CG", "CG1", "CZ",
+    "ND1", "NE", "NZ", "OD1", "OE1", "OG", "OG1", "SD", "SE", "SG",
+)
+_ATOM_SLOT = {}
+for _si, _sn in enumerate(_SLOT_NAMES):
+    _ATOM_SLOT[_sn] = _si
+    _ATOM_SLOT[f" {_sn:<3s}"] = _si
+    _ATOM_SLOT[f"{_sn:<4s}"] = _si
+
+_BB_EXTRA_NAMES = frozenset(("H", " H  ", "H   ", "HNO", " HNO", "HNO "))
+_NA_SINGLE_ATOM_VALID = frozenset((
+    "P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "O2'", "C1'",
+    " P  ", " OP1", " OP2", " O5'", " C5'", " C4'", " O4'", " C3'", " O3'", " C2'", " O2'", " C1'",
+))
+_NA_SINGLE_RESNAMES = frozenset(("A", "C", "G", "U", "DA", "DC", "DG", "DT", "T"))
+_STATIC_META = None
+
+
+def _get_static_meta():
+    global _STATIC_META
+    if _STATIC_META is not None:
+        return _STATIC_META
+    tables = get_tables()
+    cab_tables = get_cablam_tables()
+    aa_list = list(tables["aa_list"])
+    aa_to_idx = tables["aa_to_idx"]
+    chi_atoms_map = tables["chi_atoms"]
+
+    def_names = aa_list + ["mse"]
+    def_to_idx = {rn: idx for idx, rn in enumerate(def_names)}
+    chi_slots = np.zeros((len(def_names), 4, 4), dtype=np.int32)
+    chi_req = np.zeros((len(def_names), 4), dtype=bool)
+    for idx, rn in enumerate(def_names):
+        c_defs = chi_atoms_map[rn]
+        for ci, c_atoms in enumerate(c_defs):
+            chi_req[idx, ci] = True
+            for ai, an in enumerate(c_atoms):
+                chi_slots[idx, ci, ai] = _ATOM_SLOT[an.strip()]
+
+    unit_pts = np.array(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    _STATIC_META = {
+        "def_to_idx": def_to_idx,
+        "aa_to_idx": aa_to_idx,
+        "chi_slots": chi_slots,
+        "chi_req": chi_req,
+        "unit_pts": unit_pts,
+        "common_aa": cab_tables["common_aa"],
+        "all_aa": cab_tables["all_aa"],
+        "all_na": cab_tables["all_na"],
+        "d_aa": cab_tables["d_aa"],
+        "d_to_l": cab_tables["d_to_l"],
+    }
+    return _STATIC_META
+
+
+def _ensure_flat_index(h):
+    """
+    Build and cache a columnar index on JaxHierarchy `h` in a single pass so
+    ramachandran, rotamers, cbeta, omegas, and cablam can execute via vectorized
+    NumPy/JAX array indexing without repeating Python conformer/atom traversals.
+    """
+    if not isinstance(h, JaxHierarchy):
+        return None
+    if getattr(h, "_flat_index", None) is not None:
+        return h._flat_index
+
+    smeta = _get_static_meta()
+    def_to_idx = smeta["def_to_idx"]
+    aa_to_idx = smeta["aa_to_idx"]
+    common_aa = smeta["common_aa"]
+    all_aa = smeta["all_aa"]
+    all_na = smeta["all_na"]
+    d_aa = smeta["d_aa"]
+    d_to_l = smeta["d_to_l"]
+    atom_slot_get = _ATOM_SLOT.get
+
+    atoms = h.atoms()
+    if not atoms:
+        h._flat_index = {"xyz": np.zeros((0, 3), dtype=np.float64), "occ": np.zeros(0, dtype=np.float64), "chains": {}}
+        return h._flat_index
+
+    xyz = np.array([a.xyz for a in atoms], dtype=np.float64)
+    occ = np.array([a.occ for a in atoms], dtype=np.float64)
+
+    resid_cache = {}
+    resname_cache = {}
+    chains_map = {}
+
+    model = h.models()[0]
+    for ch in model.chains():
+        rgs = ch._residue_groups
+        m = len(rgs)
+        if m == 0:
+            continue
+        is_pure = True
+        seen_rc = set()
+        for rg in rgs:
+            ags = rg._atom_groups
+            if len(ags) != 1 or ags[0].altloc != "":
+                is_pure = False
+                break
+            rc_key = (rg.resseq, rg.icode)
+            if rc_key in seen_rc:
+                is_pure = False
+                break
+            seen_rc.add(rc_key)
+        if not is_pure:
+            chains_map[id(ch)] = None
+            continue
+
+        cid = ch.id
+        cid_strip = cid.strip()
+        slot_rows = []
+        has_bb_list = []
+        resnames = []
+        resids = []
+        resseqs = []
+        icodes = []
+        resseq_ints = []
+        flags_list = []
+        rota_def_list = []
+        rota_aa_list = []
+        cbeta_rt_list = []
+        cab_tidx_list = []
+        cab_classes = []
+
+        prev_ri = -1 << 60
+        prev_ic = ""
+        is_sorted = True
+
+        for rg in rgs:
+            rc_key = (rg.resseq, rg.icode)
+            rc_val = resid_cache.get(rc_key)
+            if rc_val is None:
+                rc_val = (residue_id(rg.resseq, rg.icode), _hy36decode(rg.resseq))
+                resid_cache[rc_key] = rc_val
+            resid_str, ri = rc_val
+            ic = rg.icode
+            if ri < prev_ri or (ri == prev_ri and ic < prev_ic):
+                is_sorted = False
+            prev_ri = ri
+            prev_ic = ic
+
+            ag = rg._atom_groups[0]
+            raw_rn = ag.resname
+            rn_info = resname_cache.get(raw_rn)
+            if rn_info is None:
+                rn_s = raw_rn.strip()
+                rn_u = rn_s.upper()
+                rn_l = rn_s.lower()
+                is_c_aa = rn_s in COMMON_AMINO_ACIDS
+                is_a_aa = rn_s in all_aa
+                is_d = rn_s in d_aa
+                is_g = rn_s == "GLY"
+                is_p = rn_s == "PRO"
+                is_iv = rn_s in ("ILE", "VAL")
+                is_sym = rn_l in SYM_AA
+                fl = (
+                    (1 if is_c_aa else 0)
+                    | (2 if is_a_aa else 0)
+                    | (4 if is_d else 0)
+                    | (8 if is_g else 0)
+                    | (16 if is_p else 0)
+                    | (32 if is_iv else 0)
+                    | (64 if is_sym else 0)
+                )
+                if is_c_aa and rn_l not in ("ala", "gly"):
+                    eval_r = "met" if rn_l == "mse" else rn_l
+                    r_aa = aa_to_idx.get(eval_r, -1)
+                    r_def = def_to_idx.get(rn_l, -1) if r_aa >= 0 else -1
+                else:
+                    r_aa = -1
+                    r_def = -1
+
+                if is_g:
+                    cb_rt = -1
+                elif rn_s in ("ALA", "DAL"):
+                    cb_rt = 1
+                elif rn_s in ("PRO", "DPR"):
+                    cb_rt = 2
+                elif rn_s in ("VAL", "THR", "ILE", "DVA", "DTH", "DIL"):
+                    cb_rt = 3
+                else:
+                    cb_rt = 0
+
+                if rn_u in common_aa:
+                    cab_t = 1 if rn_u == "GLY" else (2 if rn_u == "PRO" else 0)
+                else:
+                    cab_t = -1
+
+                cab_rn = d_to_l.get(rn_u, rn_u) if rn_u else None
+                not_hoh = int(cab_rn != "HOH")
+                cab_aa = int(cab_rn in all_aa) if cab_rn is not None else 0
+                cab_na = int(cab_rn in all_na) if cab_rn is not None else 0
+                cab_unk = int(cab_rn == "UNK")
+                chk_na_1 = cab_rn in _NA_SINGLE_RESNAMES
+
+                rn_info = (rn_s, fl, r_def, r_aa, cb_rt, cab_t, not_hoh, cab_aa, cab_na, cab_unk, chk_na_1)
+                resname_cache[raw_rn] = rn_info
+
+            rn_s, fl, r_def, r_aa, cb_rt, cab_t, not_hoh, cab_aa, cab_na, cab_unk, chk_na_1 = rn_info
+            ag_atoms = ag._atoms
+            if chk_na_1 and len(ag_atoms) == 1 and ag_atoms[0].name not in _NA_SINGLE_ATOM_VALID:
+                if ag_atoms[0].name.strip() not in _NA_SINGLE_ATOM_VALID:
+                    not_hoh, cab_aa, cab_na, cab_unk = 1, 0, 0, 0
+
+            row = [-1] * 21
+            has_bb = False
+            for a in ag_atoms:
+                an = a.name
+                s = atom_slot_get(an)
+                if s is None:
+                    s = atom_slot_get(an.strip())
+                if s is not None:
+                    row[s] = a.i_seq
+                    if s <= 4:
+                        has_bb = True
+                elif an in _BB_EXTRA_NAMES or an.strip() in _BB_EXTRA_NAMES:
+                    has_bb = True
+
+            slot_rows.append(row)
+            has_bb_list.append(has_bb)
+            resnames.append(rn_s)
+            resids.append(resid_str)
+            resseqs.append(rg.resseq)
+            icodes.append(ic)
+            resseq_ints.append(ri)
+            flags_list.append(fl)
+            rota_def_list.append(r_def)
+            rota_aa_list.append(r_aa)
+            cbeta_rt_list.append(cb_rt)
+            cab_tidx_list.append(cab_t)
+            cab_classes.append((cid_strip, resid_str, not_hoh, cab_aa, cab_na, cab_unk))
+
+        chains_map[id(ch)] = {
+            "cid": cid,
+            "cid_strip": cid_strip,
+            "m": m,
+            "is_sorted": is_sorted,
+            "slot_idx": np.array(slot_rows, dtype=np.int32),
+            "has_bb": np.array(has_bb_list, dtype=bool),
+            "resnames": resnames,
+            "resids": resids,
+            "resseqs": resseqs,
+            "icodes": icodes,
+            "resseq_ints": np.array(resseq_ints, dtype=np.int64),
+            "flags": np.array(flags_list, dtype=np.int32),
+            "rota_def_idx": np.array(rota_def_list, dtype=np.int32),
+            "rota_aa_idx": np.array(rota_aa_list, dtype=np.int32),
+            "cbeta_rtype": np.array(cbeta_rt_list, dtype=np.int32),
+            "cab_tidx": np.array(cab_tidx_list, dtype=np.int32),
+            "cab_classes": cab_classes,
+        }
+
+    h._flat_index = {"xyz": xyz, "occ": occ, "chains": chains_map}
+    return h._flat_index
 
 
 def ramachandran(hierarchy):
@@ -327,6 +590,10 @@ def ramachandran(hierarchy):
     vectorized JAX/GPU batch while preserving exact per-chain deduplication and sort order.
     """
     h = _ensure_hierarchy(hierarchy)
+    flat = _ensure_flat_index(h)
+    xyz_all = flat["xyz"] if flat is not None else None
+    chains_flat = flat["chains"] if flat is not None else {}
+
     tables = get_tables()
     model = h.models()[0]
 
@@ -340,141 +607,258 @@ def ramachandran(hierarchy):
             chains_by_cid[cid] = []
         chains_by_cid[cid].append(ch)
 
-    # Gather all valid triples across all chains
     triples_meta = []
-    ca0_list, c0_list, n1_list, ca1_list, c1_list, n2_list = [], [], [], [], [], []
-    om_ca0_list, om_c0_list, om_n1_list, om_ca1_list = [], [], [], []
-    is_gly_list, is_pro_list, is_ile_val_list, next_is_pro_list = [], [], [], []
+    ca0_chunks, c0_chunks, n1_chunks, ca1_chunks, c1_chunks, n2_chunks = [], [], [], [], [], []
+    om_ca0_chunks, om_c0_chunks, om_n1_chunks, om_ca1_chunks = [], [], [], []
+    is_gly_chunks, is_pro_chunks, is_ile_val_chunks, next_is_pro_chunks = [], [], [], []
+    cid_all_pure_sorted = {}
 
     for cid in chain_ids_ordered:
         uniqueness_keys = set()
-        for ch in chains_by_cid[cid]:
-            bb_ch = _select_backbone_chain(ch)
-            for conf in bb_ch.conformers():
-                conf_alt = conf.altloc
-                three = []
-                for res in conf.residues():
-                    rn = res.resname.strip()
-                    if rn not in COMMON_AMINO_ACIDS:
+        ch_list = chains_by_cid[cid]
+        can_skip_sort = len(ch_list) == 1
+        for ch in ch_list:
+            ce = chains_flat.get(id(ch))
+            if ce is not None:
+                if not ce["is_sorted"]:
+                    can_skip_sort = False
+                flags = ce["flags"]
+                bb_aa = np.flatnonzero(((flags & 1) != 0) & ce["has_bb"])
+                if len(bb_aa) < 3:
+                    continue
+                r0 = bb_aa[:-2]
+                r1 = bb_aa[1:-1]
+                r2 = bb_aa[2:]
+                s_idx = ce["slot_idx"]
+                c0_i = s_idx[r0, 2]
+                n1_i = s_idx[r1, 0]
+                ca1_i = s_idx[r1, 1]
+                c1_i = s_idx[r1, 2]
+                n2_i = s_idx[r2, 0]
+                valid = (c0_i >= 0) & (n1_i >= 0) & (ca1_i >= 0) & (c1_i >= 0) & (n2_i >= 0)
+                if not np.any(valid):
+                    continue
+                r0, r1, r2 = r0[valid], r1[valid], r2[valid]
+                c0_i, n1_i, ca1_i, c1_i, n2_i = c0_i[valid], n1_i[valid], ca1_i[valid], c1_i[valid], n2_i[valid]
+
+                d01 = np.sum((xyz_all[c0_i] - xyz_all[n1_i]) ** 2, axis=-1) < 4.0
+                d12 = np.sum((xyz_all[c1_i] - xyz_all[n2_i]) ** 2, axis=-1) < 4.0
+                valid2 = d01 & d12
+                if not np.any(valid2):
+                    continue
+                r0, r1, r2 = r0[valid2], r1[valid2], r2[valid2]
+                c0_i, n1_i, ca1_i, c1_i, n2_i = c0_i[valid2], n1_i[valid2], ca1_i[valid2], c1_i[valid2], n2_i[valid2]
+
+                resseqs = ce["resseqs"]
+                icodes = ce["icodes"]
+                resids = ce["resids"]
+                resnames = ce["resnames"]
+                resseq_ints = ce["resseq_ints"]
+                ch_id = ce["cid"]
+                ch_strip = ce["cid_strip"]
+
+                if len(ch_list) > 1 or uniqueness_keys:
+                    keep = []
+                    for idx_k, r1_k in enumerate(r1.tolist()):
+                        rk = (ch_id, resseqs[r1_k], icodes[r1_k])
+                        if rk not in uniqueness_keys:
+                            uniqueness_keys.add(rk)
+                            keep.append(idx_k)
+                    if not keep:
                         continue
-                    if three:
-                        prev_c = three[-1].find_atom_by(" C  ")
-                        curr_n = res.find_atom_by(" N  ")
-                        if prev_c is None or curr_n is None:
-                            three = [res]
+                    if len(keep) < len(r1):
+                        keep_arr = np.array(keep, dtype=np.int64)
+                        r0, r1, r2 = r0[keep_arr], r1[keep_arr], r2[keep_arr]
+                        c0_i, n1_i, ca1_i, c1_i, n2_i = (
+                            c0_i[keep_arr], n1_i[keep_arr], ca1_i[keep_arr], c1_i[keep_arr], n2_i[keep_arr]
+                        )
+
+                ca0_i = s_idx[r0, 1]
+                has_om = ca0_i >= 0
+                c0_xyz = xyz_all[c0_i]
+                n1_xyz = xyz_all[n1_i]
+                ca1_xyz = xyz_all[ca1_i]
+                c1_xyz = xyz_all[c1_i]
+                n2_xyz = xyz_all[n2_i]
+                ca0_xyz = np.where(has_om[:, None], xyz_all[np.maximum(ca0_i, 0)], 0.0)
+
+                c0_chunks.append(c0_xyz)
+                n1_chunks.append(n1_xyz)
+                ca1_chunks.append(ca1_xyz)
+                c1_chunks.append(c1_xyz)
+                n2_chunks.append(n2_xyz)
+                ca0_chunks.append(ca0_xyz)
+                om_ca0_chunks.append(ca0_xyz)
+                if np.all(has_om):
+                    om_c0_chunks.append(c0_xyz)
+                    om_n1_chunks.append(n1_xyz)
+                    om_ca1_chunks.append(ca1_xyz)
+                else:
+                    om_c0_chunks.append(np.where(has_om[:, None], c0_xyz, np.array([1.0, 0.0, 0.0])))
+                    om_n1_chunks.append(np.where(has_om[:, None], n1_xyz, np.array([0.0, 1.0, 0.0])))
+                    om_ca1_chunks.append(np.where(has_om[:, None], ca1_xyz, np.array([0.0, 0.0, 1.0])))
+
+                fl1 = flags[r1]
+                fl2 = flags[r2]
+                is_gly_chunks.append((fl1 & 8) != 0)
+                is_pro_chunks.append((fl1 & 16) != 0)
+                is_ile_val_chunks.append((fl1 & 32) != 0)
+                next_is_pro_chunks.append((fl2 & 16) != 0)
+
+                r1_list = r1.tolist()
+                ri_list = resseq_ints[r1].tolist()
+                triples_meta.extend(
+                    (cid, ch_id, ch_strip, resids[k], icodes[k], ri, resnames[k], "")
+                    for k, ri in zip(r1_list, ri_list)
+                )
+            else:
+                can_skip_sort = False
+                ca0_l, c0_l, n1_l, ca1_l, c1_l, n2_l = [], [], [], [], [], []
+                om_ca0_l, om_c0_l, om_n1_l, om_ca1_l = [], [], [], []
+                is_gly_l, is_pro_l, is_ile_val_l, next_is_pro_l = [], [], [], []
+                ch_strip = ch.id.strip()
+                bb_ch = _select_backbone_chain(ch)
+                for conf in bb_ch.conformers():
+                    conf_alt = conf.altloc
+                    three = []
+                    for res in conf.residues():
+                        rn = res.resname.strip()
+                        if rn not in COMMON_AMINO_ACIDS:
                             continue
-                        dx = prev_c.xyz[0] - curr_n.xyz[0]
-                        dy = prev_c.xyz[1] - curr_n.xyz[1]
-                        dz = prev_c.xyz[2] - curr_n.xyz[2]
-                        if dx * dx + dy * dy + dz * dz >= 4.0:
-                            three = [res]
+                        if three:
+                            prev_c = three[-1].find_atom_by(" C  ")
+                            curr_n = res.find_atom_by(" N  ")
+                            if prev_c is None or curr_n is None:
+                                three = [res]
+                                continue
+                            dx = prev_c.xyz[0] - curr_n.xyz[0]
+                            dy = prev_c.xyz[1] - curr_n.xyz[1]
+                            dz = prev_c.xyz[2] - curr_n.xyz[2]
+                            if dx * dx + dy * dy + dz * dz >= 4.0:
+                                three = [res]
+                                continue
+                        three.append(res)
+                        if len(three) > 3:
+                            three.pop(0)
+                        if len(three) < 3:
                             continue
-                    three.append(res)
-                    if len(three) > 3:
-                        three.pop(0)
-                    if len(three) < 3:
-                        continue
 
-                    r0, r1, r2 = three[0], three[1], three[2]
-                    # Check phi/psi atoms exist
-                    c0 = r0.find_atom_by(" C  ")
-                    n1 = r1.find_atom_by(" N  ")
-                    ca1 = r1.find_atom_by(" CA ")
-                    c1 = r1.find_atom_by(" C  ")
-                    n2 = r2.find_atom_by(" N  ")
-                    if c0 is None or n1 is None or ca1 is None or c1 is None or n2 is None:
-                        continue
+                        r0, r1, r2 = three[0], three[1], three[2]
+                        c0 = r0.find_atom_by(" C  ")
+                        n1 = r1.find_atom_by(" N  ")
+                        ca1 = r1.find_atom_by(" CA ")
+                        c1 = r1.find_atom_by(" C  ")
+                        n2 = r2.find_atom_by(" N  ")
+                        if c0 is None or n1 is None or ca1 is None or c1 is None or n2 is None:
+                            continue
 
-                    altloc = _get_altloc_from_three(r0, r1, r2, conf_alt, r1.is_pure_main_conf)
-                    result_key = (ch.id, r1.resseq, r1.icode)
-                    if altloc == "" and result_key in uniqueness_keys:
-                        continue
-                    uniqueness_keys.add(result_key)
+                        altloc = _get_altloc_from_three(r0, r1, r2, conf_alt, r1.is_pure_main_conf)
+                        result_key = (ch.id, r1.resseq, r1.icode)
+                        if altloc == "" and result_key in uniqueness_keys:
+                            continue
+                        uniqueness_keys.add(result_key)
 
-                    rn1 = r1.resname.strip()
-                    rn2 = r2.resname.strip()
-                    ca0 = r0.find_atom_by(" CA ")
-                    has_omega = ca0 is not None
-                    ca0_xyz = ca0.xyz if has_omega else (0.0, 0.0, 0.0)
+                        rn1 = r1.resname.strip()
+                        rn2 = r2.resname.strip()
+                        ca0 = r0.find_atom_by(" CA ")
+                        has_omega = ca0 is not None
+                        ca0_xyz = ca0.xyz if has_omega else (0.0, 0.0, 0.0)
 
-                    c0_list.append(c0.xyz)
-                    n1_list.append(n1.xyz)
-                    ca1_list.append(ca1.xyz)
-                    c1_list.append(c1.xyz)
-                    n2_list.append(n2.xyz)
-                    ca0_list.append(ca0_xyz)
-                    om_ca0_list.append(ca0_xyz)
-                    om_c0_list.append(c0.xyz if has_omega else (1.0, 0.0, 0.0))
-                    om_n1_list.append(n1.xyz if has_omega else (0.0, 1.0, 0.0))
-                    om_ca1_list.append(ca1.xyz if has_omega else (0.0, 0.0, 1.0))
+                        c0_l.append(c0.xyz)
+                        n1_l.append(n1.xyz)
+                        ca1_l.append(ca1.xyz)
+                        c1_l.append(c1.xyz)
+                        n2_l.append(n2.xyz)
+                        ca0_l.append(ca0_xyz)
+                        om_ca0_l.append(ca0_xyz)
+                        om_c0_l.append(c0.xyz if has_omega else (1.0, 0.0, 0.0))
+                        om_n1_l.append(n1.xyz if has_omega else (0.0, 1.0, 0.0))
+                        om_ca1_l.append(ca1.xyz if has_omega else (0.0, 0.0, 1.0))
 
-                    is_gly_list.append(rn1 == "GLY")
-                    is_pro_list.append(rn1 == "PRO")
-                    is_ile_val_list.append(rn1 in ("ILE", "VAL"))
-                    next_is_pro_list.append(rn2 == "PRO")
+                        is_gly_l.append(rn1 == "GLY")
+                        is_pro_l.append(rn1 == "PRO")
+                        is_ile_val_l.append(rn1 in ("ILE", "VAL"))
+                        next_is_pro_l.append(rn2 == "PRO")
 
-                    triples_meta.append((
-                        cid,
-                        ch.id,
-                        r1.resseq,
-                        r1.icode,
-                        r1.resseq_as_int(),
-                        rn1,
-                        altloc,
-                    ))
+                        triples_meta.append((
+                            cid,
+                            ch.id,
+                            ch_strip,
+                            residue_id(r1.resseq, r1.icode),
+                            r1.icode,
+                            r1.resseq_as_int(),
+                            rn1,
+                            altloc.strip(),
+                        ))
+                if c0_l:
+                    ca0_chunks.append(np.asarray(ca0_l, dtype=np.float64))
+                    c0_chunks.append(np.asarray(c0_l, dtype=np.float64))
+                    n1_chunks.append(np.asarray(n1_l, dtype=np.float64))
+                    ca1_chunks.append(np.asarray(ca1_l, dtype=np.float64))
+                    c1_chunks.append(np.asarray(c1_l, dtype=np.float64))
+                    n2_chunks.append(np.asarray(n2_l, dtype=np.float64))
+                    om_ca0_chunks.append(np.asarray(om_ca0_l, dtype=np.float64))
+                    om_c0_chunks.append(np.asarray(om_c0_l, dtype=np.float64))
+                    om_n1_chunks.append(np.asarray(om_n1_l, dtype=np.float64))
+                    om_ca1_chunks.append(np.asarray(om_ca1_l, dtype=np.float64))
+                    is_gly_chunks.append(np.asarray(is_gly_l, dtype=np.bool_))
+                    is_pro_chunks.append(np.asarray(is_pro_l, dtype=np.bool_))
+                    is_ile_val_chunks.append(np.asarray(is_ile_val_l, dtype=np.bool_))
+                    next_is_pro_chunks.append(np.asarray(next_is_pro_l, dtype=np.bool_))
+        cid_all_pure_sorted[cid] = can_skip_sort
 
     if not triples_meta:
         return []
 
     n_triples = len(triples_meta)
     bucket_n = _next_bucket(n_triples)
-    pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), bucket_n))
+    cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n))
 
     phi_arr, psi_arr, score_arr, _, eval_arr = rama_eval_batch_jax(
-        pad(ca0_list, np.float64),
-        pad(c0_list, np.float64),
-        pad(n1_list, np.float64),
-        pad(ca1_list, np.float64),
-        pad(c1_list, np.float64),
-        pad(n2_list, np.float64),
-        pad(om_ca0_list, np.float64),
-        pad(om_c0_list, np.float64),
-        pad(om_n1_list, np.float64),
-        pad(om_ca1_list, np.float64),
-        pad(is_gly_list, np.bool_),
-        pad(is_pro_list, np.bool_),
-        pad(is_ile_val_list, np.bool_),
-        pad(next_is_pro_list, np.bool_),
+        cat_pad(ca0_chunks, np.float64),
+        cat_pad(c0_chunks, np.float64),
+        cat_pad(n1_chunks, np.float64),
+        cat_pad(ca1_chunks, np.float64),
+        cat_pad(c1_chunks, np.float64),
+        cat_pad(n2_chunks, np.float64),
+        cat_pad(om_ca0_chunks, np.float64),
+        cat_pad(om_c0_chunks, np.float64),
+        cat_pad(om_n1_chunks, np.float64),
+        cat_pad(om_ca1_chunks, np.float64),
+        cat_pad(is_gly_chunks, np.bool_),
+        cat_pad(is_pro_chunks, np.bool_),
+        cat_pad(is_ile_val_chunks, np.bool_),
+        cat_pad(next_is_pro_chunks, np.bool_),
         tables["rama_tables"],
     )
 
-    phi_np = np.asarray(phi_arr[:n_triples], dtype=np.float64)
-    psi_np = np.asarray(psi_arr[:n_triples], dtype=np.float64)
-    score_np = np.asarray(score_arr[:n_triples], dtype=np.float64)
-    eval_np = np.asarray(eval_arr[:n_triples], dtype=np.int32)
+    phi_list = np.asarray(phi_arr[:n_triples], dtype=np.float64).tolist()
+    psi_list = np.asarray(psi_arr[:n_triples], dtype=np.float64).tolist()
+    score_list = np.asarray(score_arr[:n_triples], dtype=np.float64).tolist()
+    eval_list = np.asarray(eval_arr[:n_triples], dtype=np.int32).tolist()
     eval_names = ("OUTLIER", "Allowed", "Favored")
 
-    # Group by cid, sort each cid's results by (chain_id, resseq_as_int, icode, altloc)
-    # matching ramalyze's sorted(self.results, key=lambda r: r.sort_key())
+    if all(cid_all_pure_sorted.values()):
+        return [
+            (ch_strip, resid_str, rn1, alt_strip, eval_names[ev], phi, psi, sc)
+            for (_, _, ch_strip, resid_str, _, _, rn1, alt_strip), ev, phi, psi, sc in zip(
+                triples_meta, eval_list, phi_list, psi_list, score_list
+            )
+        ]
+
     by_cid = {cid: [] for cid in chain_ids_ordered}
-    for i, (cid, ch_id, resseq, icode, resseq_int, rn1, altloc) in enumerate(triples_meta):
-        sort_key = (ch_id, resseq_int, icode, altloc)
-        rec = (
-            ch_id.strip(),
-            residue_id(resseq, icode),
-            rn1,
-            altloc.strip(),
-            eval_names[int(eval_np[i])],
-            float(phi_np[i]),
-            float(psi_np[i]),
-            float(score_np[i]),
-        )
+    for i, ((cid, ch_id, ch_strip, resid_str, icode, resseq_int, rn1, alt_strip), ev, phi, psi, sc) in enumerate(
+        zip(triples_meta, eval_list, phi_list, psi_list, score_list)
+    ):
+        sort_key = (ch_id, resseq_int, icode, alt_strip)
+        rec = (ch_strip, resid_str, rn1, alt_strip, eval_names[ev], phi, psi, sc)
         by_cid[cid].append((sort_key, i, rec))
 
     out = []
     for cid in chain_ids_ordered:
         items = by_cid[cid]
-        items.sort(key=lambda x: (x[0], x[1]))
+        if not cid_all_pure_sorted.get(cid, False):
+            items.sort(key=lambda x: (x[0], x[1]))
         out.extend(x[2] for x in items)
     return out
 
@@ -504,6 +888,14 @@ def rotamers(hierarchy):
     Evaluates all sidechains across the entire model in a single vectorized JAX/GPU batch.
     """
     h = _ensure_hierarchy(hierarchy)
+    flat = _ensure_flat_index(h)
+    xyz_all = flat["xyz"] if flat is not None else None
+    chains_flat = flat["chains"] if flat is not None else {}
+    smeta = _get_static_meta()
+    chi_slots = smeta["chi_slots"]
+    chi_req = smeta["chi_req"]
+    unit_pts_np = smeta["unit_pts"]
+
     tables = get_tables()
     aa_to_idx = tables["aa_to_idx"]
     chi_atoms_map = tables["chi_atoms"]
@@ -512,86 +904,131 @@ def rotamers(hierarchy):
 
     model = h.models()[0]
     meta = []
-    p0_list, p1_list, p2_list, p3_list = [], [], [], []
-    chi_valid_list = []
-    aa_idx_list = []
-    is_sym_list = []
+    p0_chunks, p1_chunks, p2_chunks, p3_chunks = [], [], [], []
+    chi_valid_chunks = []
+    aa_idx_chunks = []
+    is_sym_chunks = []
 
-    zero_pt = (0.0, 0.0, 0.0)
     unit_pts = ((1.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 
     for ch in model.chains():
-        cid_strip = ch.id.strip()
-        for rg in ch.residue_groups():
-            resid_str = residue_id(rg.resseq, rg.icode)
-            all_dict = _construct_complete_sidechain(rg)
-            for ag in rg.atom_groups():
-                resname_strip = ag.resname.strip()
-                resname_lower = resname_strip.lower()
-                if resname_strip not in COMMON_AMINO_ACIDS:
-                    continue
-                if resname_lower in ("ala", "gly"):
-                    continue
-                eval_res = "met" if resname_lower == "mse" else resname_lower
-                aa_i = aa_to_idx.get(eval_res)
-                if aa_i is None:
-                    continue
-                atom_dict = all_dict.get(ag.altloc, {})
-                # Standardise lookup by stripped atom name (matching sidechain_angles.measureChiAngles)
-                by_name = {k.strip(): v for k, v in atom_dict.items()}
-                chi_defs = chi_atoms_map[resname_lower]
+        ce = chains_flat.get(id(ch))
+        if ce is not None:
+            r_def = ce["rota_def_idx"]
+            cand = np.flatnonzero(r_def >= 0)
+            if len(cand) == 0:
+                continue
+            def_c = r_def[cand]
+            slots_c = chi_slots[def_c]
+            req_c = chi_req[def_c]
+            s_idx = ce["slot_idx"]
+            a_idx = s_idx[cand[:, None, None], slots_c]
+            complete = np.all((a_idx >= 0) | (~req_c[:, :, None]), axis=(1, 2))
+            if not np.any(complete):
+                continue
+            cand = cand[complete]
+            a_idx = a_idx[complete]
+            req_c = req_c[complete]
+            aa_c = ce["rota_aa_idx"][cand]
+            sym_c = (ce["flags"][cand] & 64) != 0
 
-                # Check all required chi atoms exist (including chi1..3 for PRO!)
-                c_p0, c_p1, c_p2, c_p3 = [], [], [], []
-                c_val = []
-                incomplete = False
-                for c_atoms in chi_defs:
-                    a0 = by_name.get(c_atoms[0])
-                    a1 = by_name.get(c_atoms[1])
-                    a2 = by_name.get(c_atoms[2])
-                    a3 = by_name.get(c_atoms[3])
-                    if a0 is None or a1 is None or a2 is None or a3 is None:
-                        incomplete = True
-                        break
-                    c_p0.append(a0.xyz)
-                    c_p1.append(a1.xyz)
-                    c_p2.append(a2.xyz)
-                    c_p3.append(a3.xyz)
-                    c_val.append(True)
-                if incomplete:
-                    continue
+            pts = xyz_all[np.maximum(a_idx, 0)]
+            pts = np.where(req_c[:, :, None, None], pts, unit_pts_np[None, None, :, :])
 
-                while len(c_val) < 4:
-                    c_p0.append(unit_pts[0])
-                    c_p1.append(unit_pts[1])
-                    c_p2.append(unit_pts[2])
-                    c_p3.append(unit_pts[3])
-                    c_val.append(False)
+            p0_chunks.append(pts[:, :, 0, :])
+            p1_chunks.append(pts[:, :, 1, :])
+            p2_chunks.append(pts[:, :, 2, :])
+            p3_chunks.append(pts[:, :, 3, :])
+            chi_valid_chunks.append(req_c)
+            aa_idx_chunks.append(aa_c)
+            is_sym_chunks.append(sym_c)
 
-                p0_list.append(c_p0)
-                p1_list.append(c_p1)
-                p2_list.append(c_p2)
-                p3_list.append(c_p3)
-                chi_valid_list.append(c_val)
-                aa_idx_list.append(aa_i)
-                is_sym_list.append(resname_lower in SYM_AA)
-                meta.append((cid_strip, resid_str, resname_strip, ag.altloc.strip(), aa_i))
+            cid_strip = ce["cid_strip"]
+            resids = ce["resids"]
+            resnames = ce["resnames"]
+            cand_list = cand.tolist()
+            aa_list_c = aa_c.tolist()
+            meta.extend((cid_strip, resids[k], resnames[k], "", ai) for k, ai in zip(cand_list, aa_list_c))
+        else:
+            p0_l, p1_l, p2_l, p3_l = [], [], [], []
+            chi_valid_l, aa_idx_l, is_sym_l = [], [], []
+            cid_strip = ch.id.strip()
+            for rg in ch.residue_groups():
+                resid_str = residue_id(rg.resseq, rg.icode)
+                all_dict = _construct_complete_sidechain(rg)
+                for ag in rg.atom_groups():
+                    resname_strip = ag.resname.strip()
+                    resname_lower = resname_strip.lower()
+                    if resname_strip not in COMMON_AMINO_ACIDS:
+                        continue
+                    if resname_lower in ("ala", "gly"):
+                        continue
+                    eval_res = "met" if resname_lower == "mse" else resname_lower
+                    aa_i = aa_to_idx.get(eval_res)
+                    if aa_i is None:
+                        continue
+                    atom_dict = all_dict.get(ag.altloc, {})
+                    by_name = {k.strip(): v for k, v in atom_dict.items()}
+                    chi_defs = chi_atoms_map[resname_lower]
+
+                    c_p0, c_p1, c_p2, c_p3 = [], [], [], []
+                    c_val = []
+                    incomplete = False
+                    for c_atoms in chi_defs:
+                        a0 = by_name.get(c_atoms[0])
+                        a1 = by_name.get(c_atoms[1])
+                        a2 = by_name.get(c_atoms[2])
+                        a3 = by_name.get(c_atoms[3])
+                        if a0 is None or a1 is None or a2 is None or a3 is None:
+                            incomplete = True
+                            break
+                        c_p0.append(a0.xyz)
+                        c_p1.append(a1.xyz)
+                        c_p2.append(a2.xyz)
+                        c_p3.append(a3.xyz)
+                        c_val.append(True)
+                    if incomplete:
+                        continue
+
+                    while len(c_val) < 4:
+                        c_p0.append(unit_pts[0])
+                        c_p1.append(unit_pts[1])
+                        c_p2.append(unit_pts[2])
+                        c_p3.append(unit_pts[3])
+                        c_val.append(False)
+
+                    p0_l.append(c_p0)
+                    p1_l.append(c_p1)
+                    p2_l.append(c_p2)
+                    p3_l.append(c_p3)
+                    chi_valid_l.append(c_val)
+                    aa_idx_l.append(aa_i)
+                    is_sym_l.append(resname_lower in SYM_AA)
+                    meta.append((cid_strip, resid_str, resname_strip, ag.altloc.strip(), aa_i))
+            if p0_l:
+                p0_chunks.append(np.asarray(p0_l, dtype=np.float64))
+                p1_chunks.append(np.asarray(p1_l, dtype=np.float64))
+                p2_chunks.append(np.asarray(p2_l, dtype=np.float64))
+                p3_chunks.append(np.asarray(p3_l, dtype=np.float64))
+                chi_valid_chunks.append(np.asarray(chi_valid_l, dtype=np.bool_))
+                aa_idx_chunks.append(np.asarray(aa_idx_l, dtype=np.int32))
+                is_sym_chunks.append(np.asarray(is_sym_l, dtype=np.bool_))
 
     if not meta:
         return []
 
     n_rota = len(meta)
     bucket_n = _next_bucket(n_rota)
-    pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), bucket_n))
+    cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n))
 
     score_arr, eval_arr, box_arr = rotamer_eval_batch_jax(
-        pad(p0_list, np.float64),
-        pad(p1_list, np.float64),
-        pad(p2_list, np.float64),
-        pad(p3_list, np.float64),
-        pad(chi_valid_list, np.bool_),
-        pad(aa_idx_list, np.int32),
-        pad(is_sym_list, np.bool_),
+        cat_pad(p0_chunks, np.float64),
+        cat_pad(p1_chunks, np.float64),
+        cat_pad(p2_chunks, np.float64),
+        cat_pad(p3_chunks, np.float64),
+        cat_pad(chi_valid_chunks, np.bool_),
+        cat_pad(aa_idx_chunks, np.int32),
+        cat_pad(is_sym_chunks, np.bool_),
         tables["rota_flat"],
         tables["rota_offset"],
         tables["rota_ndim"],
@@ -605,29 +1042,24 @@ def rotamers(hierarchy):
         tables["box_valid"],
     )
 
-    score_np = np.asarray(score_arr[:n_rota], dtype=np.float64)
-    eval_np = np.asarray(eval_arr[:n_rota], dtype=np.int32)
-    box_np = np.asarray(box_arr[:n_rota], dtype=np.int32)
+    score_list = np.asarray(score_arr[:n_rota], dtype=np.float64).tolist()
+    eval_list = np.asarray(eval_arr[:n_rota], dtype=np.int32).tolist()
+    box_list = np.asarray(box_arr[:n_rota], dtype=np.int32).tolist()
 
-    out = []
-    for i, (cid_strip, resid_str, resname_strip, alt_strip, aa_i) in enumerate(meta):
-        ev_code = int(eval_np[i])
-        ev_str = eval_names[ev_code]
-        if ev_code == 0:
-            rname = "OUTLIER"
-        else:
-            b_idx = int(box_np[i])
-            rname = box_names[aa_i][b_idx] if b_idx >= 0 else "UNCLASSIFIED"
-        out.append((
+    return [
+        (
             cid_strip,
             resid_str,
             resname_strip,
             alt_strip,
-            ev_str,
-            rname,
-            float(score_np[i]),
-        ))
-    return out
+            eval_names[ev_code],
+            "OUTLIER" if ev_code == 0 else (box_names[aa_i][b_idx] if b_idx >= 0 else "UNCLASSIFIED"),
+            sc,
+        )
+        for (cid_strip, resid_str, resname_strip, alt_strip, aa_i), ev_code, b_idx, sc in zip(
+            meta, eval_list, box_list, score_list
+        )
+    ]
 
 
 def _rotate_point_around_axis_jax(axis_p1, axis_p2, point, angle_deg):
@@ -726,86 +1158,120 @@ def cbeta(hierarchy):
     Vectorized JAX/GPU implementation bit-exact with mmtbx.validation.cbetadev.
     """
     h = _ensure_hierarchy(hierarchy)
+    flat = _ensure_flat_index(h)
+    xyz_all = flat["xyz"] if flat is not None else None
+    occ_all = flat["occ"] if flat is not None else None
+    chains_flat = flat["chains"] if flat is not None else {}
+
     cab_tables = get_cablam_tables()
     common_aa = cab_tables["common_aa"]
     d_aa = cab_tables["d_aa"]
 
     model = h.models()[0]
     meta = []
-    n_list, ca_list, c_list, cb_list = [], [], [], []
-    rtype_list, common_list, daa_list = [], [], []
+    n_chunks, ca_chunks, c_chunks, cb_chunks = [], [], [], []
+    rtype_chunks, common_chunks, daa_chunks = [], [], []
 
     for ch in model.chains():
-        cid_strip = ch.id.strip()
-        for rg in ch.residue_groups():
-            resid_str = residue_id(rg.resseq, rg.icode)
-            for i_cf, cf in enumerate(rg.conformers()):
-                for res in cf.residues():
-                    rn_strip = res.resname.strip()
-                    if rn_strip == "GLY":
-                        continue
-                    is_alt_conf = False
-                    rel = {}
-                    for a in res.atoms():
-                        if a.name in (" CA ", " N  ", " C  ", " CB "):
-                            rel[a.name] = a
-                            ag = a.parent()
-                            if ag is not None and len(ag.altloc) != 0:
-                                is_alt_conf = True
-                    if (i_cf == 0 or is_alt_conf) and len(rel) == 4:
-                        res_ca = rel[" CA "]
-                        res_n = rel[" N  "]
-                        res_c = rel[" C  "]
-                        res_cb = rel[" CB "]
-                        altchar = cf.altloc.strip() if is_alt_conf else ""
-                        if rn_strip in ("ALA", "DAL"):
-                            rt = 1
-                        elif rn_strip in ("PRO", "DPR"):
-                            rt = 2
-                        elif rn_strip in ("VAL", "THR", "ILE", "DVA", "DTH", "DIL"):
-                            rt = 3
-                        else:
-                            rt = 0
-                        n_list.append(res_n.xyz)
-                        ca_list.append(res_ca.xyz)
-                        c_list.append(res_c.xyz)
-                        cb_list.append(res_cb.xyz)
-                        rtype_list.append(rt)
-                        common_list.append(rn_strip in common_aa)
-                        daa_list.append(rn_strip in d_aa)
-                        meta.append((cid_strip, resid_str, rn_strip, altchar, float(res_cb.occ)))
+        ce = chains_flat.get(id(ch))
+        if ce is not None:
+            s_idx = ce["slot_idx"]
+            n_i = s_idx[:, 0]
+            ca_i = s_idx[:, 1]
+            c_i = s_idx[:, 2]
+            cb_i = s_idx[:, 4]
+            rt = ce["cbeta_rtype"]
+            cand = np.flatnonzero((rt >= 0) & (n_i >= 0) & (ca_i >= 0) & (c_i >= 0) & (cb_i >= 0))
+            if len(cand) == 0:
+                continue
+            n_chunks.append(xyz_all[n_i[cand]])
+            ca_chunks.append(xyz_all[ca_i[cand]])
+            c_chunks.append(xyz_all[c_i[cand]])
+            cb_chunks.append(xyz_all[cb_i[cand]])
+            rtype_chunks.append(rt[cand])
+            fl_c = ce["flags"][cand]
+            common_chunks.append((fl_c & 1) != 0)
+            daa_chunks.append((fl_c & 4) != 0)
+
+            cid_strip = ce["cid_strip"]
+            resids = ce["resids"]
+            resnames = ce["resnames"]
+            cand_list = cand.tolist()
+            occ_list = occ_all[cb_i[cand]].tolist()
+            meta.extend((cid_strip, resids[k], resnames[k], "", oc) for k, oc in zip(cand_list, occ_list))
+        else:
+            n_l, ca_l, c_l, cb_l = [], [], [], []
+            rtype_l, common_l, daa_l = [], [], []
+            cid_strip = ch.id.strip()
+            for rg in ch.residue_groups():
+                resid_str = residue_id(rg.resseq, rg.icode)
+                for i_cf, cf in enumerate(rg.conformers()):
+                    for res in cf.residues():
+                        rn_strip = res.resname.strip()
+                        if rn_strip == "GLY":
+                            continue
+                        is_alt_conf = False
+                        rel = {}
+                        for a in res.atoms():
+                            if a.name in (" CA ", " N  ", " C  ", " CB "):
+                                rel[a.name] = a
+                                ag = a.parent()
+                                if ag is not None and len(ag.altloc) != 0:
+                                    is_alt_conf = True
+                        if (i_cf == 0 or is_alt_conf) and len(rel) == 4:
+                            res_ca = rel[" CA "]
+                            res_n = rel[" N  "]
+                            res_c = rel[" C  "]
+                            res_cb = rel[" CB "]
+                            altchar = cf.altloc.strip() if is_alt_conf else ""
+                            if rn_strip in ("ALA", "DAL"):
+                                rt_v = 1
+                            elif rn_strip in ("PRO", "DPR"):
+                                rt_v = 2
+                            elif rn_strip in ("VAL", "THR", "ILE", "DVA", "DTH", "DIL"):
+                                rt_v = 3
+                            else:
+                                rt_v = 0
+                            n_l.append(res_n.xyz)
+                            ca_l.append(res_ca.xyz)
+                            c_l.append(res_c.xyz)
+                            cb_l.append(res_cb.xyz)
+                            rtype_l.append(rt_v)
+                            common_l.append(rn_strip in common_aa)
+                            daa_l.append(rn_strip in d_aa)
+                            meta.append((cid_strip, resid_str, rn_strip, altchar, float(res_cb.occ)))
+            if n_l:
+                n_chunks.append(np.asarray(n_l, dtype=np.float64))
+                ca_chunks.append(np.asarray(ca_l, dtype=np.float64))
+                c_chunks.append(np.asarray(c_l, dtype=np.float64))
+                cb_chunks.append(np.asarray(cb_l, dtype=np.float64))
+                rtype_chunks.append(np.asarray(rtype_l, dtype=np.int32))
+                common_chunks.append(np.asarray(common_l, dtype=np.bool_))
+                daa_chunks.append(np.asarray(daa_l, dtype=np.bool_))
 
     if not meta:
         return []
 
     n_items = len(meta)
     bucket_n = _next_bucket(n_items)
-    pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), bucket_n))
+    cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n))
 
     dev_arr, dih_arr = _cbeta_batch_kernel(
-        pad(n_list, np.float64),
-        pad(ca_list, np.float64),
-        pad(c_list, np.float64),
-        pad(cb_list, np.float64),
-        pad(rtype_list, np.int32),
-        pad(common_list, np.bool_),
-        pad(daa_list, np.bool_),
+        cat_pad(n_chunks, np.float64),
+        cat_pad(ca_chunks, np.float64),
+        cat_pad(c_chunks, np.float64),
+        cat_pad(cb_chunks, np.float64),
+        cat_pad(rtype_chunks, np.int32),
+        cat_pad(common_chunks, np.bool_),
+        cat_pad(daa_chunks, np.bool_),
     )
-    dev_np = np.asarray(dev_arr[:n_items], dtype=np.float64)
-    dih_np = np.asarray(dih_arr[:n_items], dtype=np.float64)
+    dev_list = np.asarray(dev_arr[:n_items], dtype=np.float64).tolist()
+    dih_list = np.asarray(dih_arr[:n_items], dtype=np.float64).tolist()
 
-    out = []
-    for i, (cid_strip, resid_str, rn_strip, altchar, occ) in enumerate(meta):
-        out.append((
-            cid_strip,
-            resid_str,
-            rn_strip,
-            altchar,
-            float(dev_np[i]),
-            float(dih_np[i]),
-            occ,
-        ))
-    return out
+    return [
+        (cid_strip, resid_str, rn_strip, altchar, dev, dih, occ)
+        for (cid_strip, resid_str, rn_strip, altchar, occ), dev, dih in zip(meta, dev_list, dih_list)
+    ]
 
 
 def _local_altloc_from_atoms(atoms):
@@ -825,97 +1291,149 @@ def omegas(hierarchy):
     Vectorized JAX/GPU implementation bit-exact with remolprobity.residues.omegas.
     """
     h = _ensure_hierarchy(hierarchy)
+    flat = _ensure_flat_index(h)
+    xyz_all = flat["xyz"] if flat is not None else None
+    chains_flat = flat["chains"] if flat is not None else {}
+
     all_aa = get_cablam_tables()["all_aa"]
     model = h.models()[0]
 
     meta = []
-    ca0_list, c0_list, n1_list, ca1_list = [], [], [], []
+    ca0_chunks, c0_chunks, n1_chunks, ca1_chunks = [], [], [], []
 
     for ch in model.chains():
-        cid_strip = ch.id.strip()
-        bb_ch = _select_backbone_chain(ch)
-        for conf in bb_ch.conformers():
-            conf_alt = conf.altloc
-            two = []
-            for res in conf.residues():
-                rn = res.resname.strip()
-                if rn not in all_aa:
-                    continue
-                if two:
-                    prev_c = two[-1].find_atom_by(" C  ")
-                    curr_n = res.find_atom_by(" N  ")
-                    if prev_c is None or curr_n is None:
-                        two = [res]
-                        continue
-                    dx = prev_c.xyz[0] - curr_n.xyz[0]
-                    dy = prev_c.xyz[1] - curr_n.xyz[1]
-                    dz = prev_c.xyz[2] - curr_n.xyz[2]
-                    if dx * dx + dy * dy + dz * dz >= 4.0:
-                        two = [res]
-                        continue
-                two.append(res)
-                if len(two) > 2:
-                    two.pop(0)
-                if len(two) < 2:
-                    continue
+        ce = chains_flat.get(id(ch))
+        if ce is not None:
+            bb_aa = np.flatnonzero(((ce["flags"] & 2) != 0) & ce["has_bb"])
+            if len(bb_aa) < 2:
+                continue
+            r0 = bb_aa[:-1]
+            r1 = bb_aa[1:]
+            s_idx = ce["slot_idx"]
+            ca0_i = s_idx[r0, 1]
+            c0_i = s_idx[r0, 2]
+            n1_i = s_idx[r1, 0]
+            ca1_i = s_idx[r1, 1]
+            valid = (ca0_i >= 0) & (c0_i >= 0) & (n1_i >= 0) & (ca1_i >= 0)
+            if not np.any(valid):
+                continue
+            r0, r1 = r0[valid], r1[valid]
+            ca0_i, c0_i, n1_i, ca1_i = ca0_i[valid], c0_i[valid], n1_i[valid], ca1_i[valid]
+            valid2 = np.sum((xyz_all[c0_i] - xyz_all[n1_i]) ** 2, axis=-1) < 4.0
+            if not np.any(valid2):
+                continue
+            r0, r1 = r0[valid2], r1[valid2]
+            ca0_i, c0_i, n1_i, ca1_i = ca0_i[valid2], c0_i[valid2], n1_i[valid2], ca1_i[valid2]
 
-                r0, r1 = two[0], two[1]
-                prev_ca = prev_c = this_n = this_ca = None
-                for a in r0.atoms():
-                    if a.name == " CA ":
-                        prev_ca = a
-                    elif a.name == " C  ":
-                        prev_c = a
-                for a in r1.atoms():
-                    if a.name == " N  ":
-                        this_n = a
-                    elif a.name == " CA ":
-                        this_ca = a
-                if prev_ca is None or prev_c is None or this_n is None or this_ca is None:
-                    continue
+            ca0_chunks.append(xyz_all[ca0_i])
+            c0_chunks.append(xyz_all[c0_i])
+            n1_chunks.append(xyz_all[n1_i])
+            ca1_chunks.append(xyz_all[ca1_i])
 
-                atoms = [prev_ca, prev_c, this_n, this_ca]
-                ca0_list.append(prev_ca.xyz)
-                c0_list.append(prev_c.xyz)
-                n1_list.append(this_n.xyz)
-                ca1_list.append(this_ca.xyz)
-                meta.append((
-                    cid_strip,
-                    residue_id(r1.resseq, r1.icode),
-                    r1.resname.strip(),
-                    _local_altloc_from_atoms(atoms[2:]),
-                    residue_id(r0.resseq, r0.icode),
-                    _local_altloc_from_atoms(atoms[0:2]),
-                    conf_alt,
-                    _local_altloc_from_atoms(atoms),
-                ))
+            cid_strip = ce["cid_strip"]
+            resids = ce["resids"]
+            resnames = ce["resnames"]
+            r0_list = r0.tolist()
+            r1_list = r1.tolist()
+            meta.extend(
+                (cid_strip, resids[k1], resnames[k1], "", resids[k0], "", "", "")
+                for k0, k1 in zip(r0_list, r1_list)
+            )
+        else:
+            ca0_l, c0_l, n1_l, ca1_l = [], [], [], []
+            cid_strip = ch.id.strip()
+            bb_ch = _select_backbone_chain(ch)
+            for conf in bb_ch.conformers():
+                conf_alt = conf.altloc
+                two = []
+                for res in conf.residues():
+                    rn = res.resname.strip()
+                    if rn not in all_aa:
+                        continue
+                    if two:
+                        prev_c = two[-1].find_atom_by(" C  ")
+                        curr_n = res.find_atom_by(" N  ")
+                        if prev_c is None or curr_n is None:
+                            two = [res]
+                            continue
+                        dx = prev_c.xyz[0] - curr_n.xyz[0]
+                        dy = prev_c.xyz[1] - curr_n.xyz[1]
+                        dz = prev_c.xyz[2] - curr_n.xyz[2]
+                        if dx * dx + dy * dy + dz * dz >= 4.0:
+                            two = [res]
+                            continue
+                    two.append(res)
+                    if len(two) > 2:
+                        two.pop(0)
+                    if len(two) < 2:
+                        continue
+
+                    r0, r1 = two[0], two[1]
+                    prev_ca = prev_c = this_n = this_ca = None
+                    for a in r0.atoms():
+                        if a.name == " CA ":
+                            prev_ca = a
+                        elif a.name == " C  ":
+                            prev_c = a
+                    for a in r1.atoms():
+                        if a.name == " N  ":
+                            this_n = a
+                        elif a.name == " CA ":
+                            this_ca = a
+                    if prev_ca is None or prev_c is None or this_n is None or this_ca is None:
+                        continue
+
+                    atoms = [prev_ca, prev_c, this_n, this_ca]
+                    ca0_l.append(prev_ca.xyz)
+                    c0_l.append(prev_c.xyz)
+                    n1_l.append(this_n.xyz)
+                    ca1_l.append(this_ca.xyz)
+                    meta.append((
+                        cid_strip,
+                        residue_id(r1.resseq, r1.icode),
+                        r1.resname.strip(),
+                        _local_altloc_from_atoms(atoms[2:]),
+                        residue_id(r0.resseq, r0.icode),
+                        _local_altloc_from_atoms(atoms[0:2]),
+                        conf_alt,
+                        _local_altloc_from_atoms(atoms),
+                    ))
+            if ca0_l:
+                ca0_chunks.append(np.asarray(ca0_l, dtype=np.float64))
+                c0_chunks.append(np.asarray(c0_l, dtype=np.float64))
+                n1_chunks.append(np.asarray(n1_l, dtype=np.float64))
+                ca1_chunks.append(np.asarray(ca1_l, dtype=np.float64))
 
     if not meta:
         return []
 
     n_items = len(meta)
     bucket_n = _next_bucket(n_items)
-    pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), bucket_n))
+    cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n))
 
     omega_arr = dihedral_angles_jax(
-        pad(ca0_list, np.float64),
-        pad(c0_list, np.float64),
-        pad(n1_list, np.float64),
-        pad(ca1_list, np.float64),
+        cat_pad(ca0_chunks, np.float64),
+        cat_pad(c0_chunks, np.float64),
+        cat_pad(n1_chunks, np.float64),
+        cat_pad(ca1_chunks, np.float64),
     )
-    omega_np = np.asarray(omega_arr[:n_items], dtype=np.float64)
+    omega_list = np.asarray(omega_arr[:n_items], dtype=np.float64).tolist()
 
-    out = []
-    for i, (cid_strip, res1_id, rn1, alt1, res0_id, alt0, conf_alt, pep_alt) in enumerate(meta):
-        om = float(omega_np[i])
-        if -30.0 < om < 30.0:
-            om_type = "Cis"
-        elif om < -150.0 or om > 150.0:
-            om_type = "Trans"
-        else:
-            om_type = "Twisted"
-        out.append((cid_strip, res1_id, rn1, alt1, res0_id, alt0, om, om_type, conf_alt, pep_alt))
-    return out
+    return [
+        (
+            cid_strip,
+            res1_id,
+            rn1,
+            alt1,
+            res0_id,
+            alt0,
+            om,
+            "Cis" if -30.0 < om < 30.0 else ("Trans" if (om < -150.0 or om > 150.0) else "Twisted"),
+            conf_alt,
+            pep_alt,
+        )
+        for (cid_strip, res1_id, rn1, alt1, res0_id, alt0, conf_alt, pep_alt), om in zip(meta, omega_list)
+    ]
 
 
 def _ndt_interp_3d_jax(tables_3d, t_idx, x0, x1, x2, min2, nbins2):
@@ -1012,6 +1530,46 @@ def _cablam_eval_batch_kernel(mu_in, mu_out, nu, ca_virt, t_idx, pep_tables, ca_
     return cab_score, ca_score
 
 
+@jax.jit
+def _cablam_fused_batch_kernel(
+    ca0, ca1, ca2, ca3, ca4, o1, o2, c1, n2,
+    has_nu_in, has_omega, base_tidx, pep_tables, ca_tables
+):
+    """Fused virtual geometry + 3D contour evaluation for pure main-conformation chains."""
+    mu_in = dihedral_angles_jax(ca0, ca1, ca2, ca3)
+    mu_out = dihedral_angles_jax(ca1, ca2, ca3, ca4)
+
+    v1 = ca1 - ca2
+    v3 = ca3 - ca2
+    n1_sq = jnp.sum(v1 * v1, axis=-1)
+    n3_sq = jnp.sum(v3 * v3, axis=-1)
+    denom = jnp.sqrt(n1_sq * n3_sq)
+    safe_denom = jnp.where(denom > 0.0, denom, 1.0)
+    cos_ang = jnp.clip(jnp.sum(v1 * v3, axis=-1) / safe_denom, -1.0, 1.0)
+    ca_virt = jnp.arccos(cos_ang) * (180.0 / jnp.pi)
+
+    def _perptersect(a1, a2, b1):
+        u = a2 - a1
+        u_sq = jnp.sum(u * u, axis=-1, keepdims=True)
+        valid = u_sq[:, 0] > 0.0
+        safe_u_sq = jnp.where(u_sq > 0.0, u_sq, 1.0)
+        t = jnp.sum((b1 - a1) * u, axis=-1, keepdims=True) / safe_u_sq
+        return a1 + t * u, valid
+
+    x1, v_x1 = _perptersect(ca1, ca2, o1)
+    x2, v_x2 = _perptersect(ca2, ca3, o2)
+    valid_nu = has_nu_in & v_x1 & v_x2
+    nu = jnp.where(valid_nu, dihedral_angles_jax(o1, x1, x2, o2), 0.0)
+    omega = dihedral_angles_jax(ca1, c1, n2, ca2)
+
+    is_cis_pro = (base_tidx == 2) & has_omega & (omega >= -90.0) & (omega <= 90.0)
+    t_idx = jnp.where(is_cis_pro, 3, base_tidx)
+
+    cab_score = _ndt_interp_3d_jax(pep_tables, t_idx, mu_in, mu_out, nu, -180.0, 120)
+    ca_score = _ndt_interp_3d_jax(ca_tables, t_idx, mu_in, mu_out, ca_virt, 0.0, 60)
+    return cab_score, ca_score, valid_nu
+
+
 def cablam(hierarchy, owned):
     """
     CaBLAM in each chain object of hierarchy on its own, as cablamalyze
@@ -1019,6 +1577,10 @@ def cablam(hierarchy, owned):
     Vectorized JAX/GPU implementation bit-exact with remolprobity.residues.cablam.
     """
     h = _ensure_hierarchy(hierarchy)
+    flat = _ensure_flat_index(h)
+    xyz_all = flat["xyz"] if flat is not None else None
+    chains_flat = flat["chains"] if flat is not None else {}
+
     cab_tables = get_cablam_tables()
     common_aa = cab_tables["common_aa"]
     all_aa = cab_tables["all_aa"]
@@ -1029,7 +1591,13 @@ def cablam(hierarchy, owned):
     model = h.models()[0]
     model_id = model.id
 
-    # First pass: collect classes and build per-chain, per-conformer linked residue nodes
+    # Fast path for pure main-conformation chains + fallback for chains with altlocs
+    pure_owned_lists = []
+    pure_eval_targets = []
+    f_ca0, f_ca1, f_ca2, f_ca3, f_ca4 = [], [], [], [], []
+    f_o1, f_o2, f_c1, f_n2 = [], [], [], []
+    f_has_nu, f_has_om, f_tidx = [], [], []
+
     chains_work = []
     geom_nodes = []
     ca0_l, ca1_l, ca2_l, ca3_l, ca4_l = [], [], [], [], []
@@ -1038,8 +1606,101 @@ def cablam(hierarchy, owned):
 
     z0 = (0.0, 0.0, 0.0)
     u1, u2, u3 = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)
+    u1_np = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    u3_np = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
     for chain in model.chains():
+        ce = chains_flat.get(id(chain))
+        if ce is not None:
+            cid = ce["cid_strip"]
+            resids = ce["resids"]
+            resnames = ce["resnames"]
+            cab_cls_all = ce["cab_classes"]
+            mine = [owned(cid, rid) for rid in resids]
+            if not any(mine):
+                continue
+            if all(mine):
+                classes.extend(cab_cls_all)
+                mine_arr = None
+            else:
+                classes.extend(c for c, m_flag in zip(cab_cls_all, mine) if m_flag)
+                mine_arr = np.array(mine, dtype=bool)
+
+            m = ce["m"]
+            s_idx = ce["slot_idx"]
+            n_i = s_idx[:, 0]
+            ca_i = s_idx[:, 1]
+            c_i = s_idx[:, 2]
+            o_i = s_idx[:, 3]
+            has_ca = ca_i >= 0
+            has_mc = has_ca & (c_i >= 0) & (n_i >= 0) & (o_i >= 0)
+
+            if m >= 2:
+                both_ca = has_ca[:-1] & has_ca[1:]
+                both_mc = has_mc[:-1] & has_mc[1:]
+                d_cn = np.sum((xyz_all[np.maximum(c_i[:-1], 0)] - xyz_all[np.maximum(n_i[1:], 0)]) ** 2, axis=-1) < 4.0
+                d_caca = np.sum((xyz_all[np.maximum(ca_i[:-1], 0)] - xyz_all[np.maximum(ca_i[1:], 0)]) ** 2, axis=-1) < 20.25
+                linked = both_ca & np.where(both_mc, d_cn, d_caca)
+            else:
+                linked = np.zeros(0, dtype=bool)
+
+            L = np.concatenate([[False, False], linked, [False, False]])
+            link_p1 = L[1 : m + 1]
+            link_n1 = L[2 : m + 2]
+            link_p2 = L[0:m]
+            link_n2 = L[3 : m + 3]
+            has_ca3 = has_ca & link_p1 & link_n1
+            has_mu_in = has_ca3 & link_p2
+            has_mu_out = has_ca3 & link_n2
+            mc_p1 = np.concatenate([[False], has_mc[:-1]])
+            mc_n1 = np.concatenate([has_mc[1:], [False]])
+            has_nu = has_mc & link_p1 & link_n1 & mc_p1 & mc_n1
+            has_om = has_mc & link_p1 & mc_p1
+
+            owned_ca = np.flatnonzero(has_ca if mine_arr is None else (has_ca & mine_arr))
+            if len(owned_ca) == 0:
+                continue
+            if not ce["is_sorted"]:
+                ri_arr = ce["resseq_ints"]
+                ic_list = ce["icodes"]
+                order = sorted(range(len(owned_ca)), key=lambda idx: (int(ri_arr[owned_ca[idx]]), ic_list[owned_ca[idx]]))
+                owned_ca = owned_ca[np.array(order, dtype=np.int64)]
+
+            oca_list = owned_ca.tolist()
+            ch_recs = [[cid, resids[k], resnames[k], "", None, None] for k in oca_list]
+            pure_owned_lists.append(("pure", ch_recs))
+
+            cab_t = ce["cab_tidx"]
+            ev_mask = (cab_t[owned_ca] >= 0) & has_mu_in[owned_ca] & has_mu_out[owned_ca]
+            if np.any(ev_mask):
+                ev_pos = np.flatnonzero(ev_mask)
+                ev_r = owned_ca[ev_pos]
+                for pos in ev_pos.tolist():
+                    pure_eval_targets.append(ch_recs[pos])
+                f_ca0.append(xyz_all[ca_i[ev_r - 2]])
+                f_ca1.append(xyz_all[ca_i[ev_r - 1]])
+                f_ca2.append(xyz_all[ca_i[ev_r]])
+                f_ca3.append(xyz_all[ca_i[ev_r + 1]])
+                f_ca4.append(xyz_all[ca_i[ev_r + 2]])
+                h_nu_e = has_nu[ev_r]
+                h_om_e = has_om[ev_r]
+                f_has_nu.append(h_nu_e)
+                f_has_om.append(h_om_e)
+                f_tidx.append(cab_t[ev_r])
+                if np.all(h_nu_e):
+                    f_o1.append(xyz_all[o_i[ev_r - 1]])
+                    f_o2.append(xyz_all[o_i[ev_r]])
+                else:
+                    f_o1.append(np.where(h_nu_e[:, None], xyz_all[np.maximum(o_i[ev_r - 1], 0)], u1_np))
+                    f_o2.append(np.where(h_nu_e[:, None], xyz_all[np.maximum(o_i[ev_r], 0)], u3_np))
+                if np.all(h_om_e):
+                    f_c1.append(xyz_all[c_i[ev_r - 1]])
+                    f_n2.append(xyz_all[n_i[ev_r]])
+                else:
+                    f_c1.append(np.where(h_om_e[:, None], xyz_all[np.maximum(c_i[ev_r - 1], 0)], u1_np))
+                    f_n2.append(np.where(h_om_e[:, None], xyz_all[np.maximum(n_i[ev_r], 0)], u3_np))
+            continue
+
         cid = chain.id.strip()
         keys = [(cid, residue_id(rg.resseq, rg.icode)) for rg in chain.residue_groups()]
         mine = [owned(*k) for k in keys]
@@ -1128,7 +1789,6 @@ def cablam(hierarchy, owned):
                 if sid not in cur_conf_res:
                     cur_conf_res[sid] = node
 
-        # Collect nodes that need geometry calculation
         for cname in conformer_ids:
             for sid, node in results_by_conformer[cname].items():
                 p1 = node["prev"]
@@ -1156,8 +1816,38 @@ def cablam(hierarchy, owned):
                 has_nu_l.append(has_nu)
                 has_om_l.append(has_om)
 
+        pure_owned_lists.append(("alt", len(chains_work)))
         chains_work.append((conformer_ids, results_by_conformer, all_keys))
 
+    if pure_eval_targets:
+        n_f = len(pure_eval_targets)
+        b_f = _next_bucket(n_f)
+        cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), b_f))
+        cab_f, ca_f, vnu_f = _cablam_fused_batch_kernel(
+            cat_pad(f_ca0, np.float64),
+            cat_pad(f_ca1, np.float64),
+            cat_pad(f_ca2, np.float64),
+            cat_pad(f_ca3, np.float64),
+            cat_pad(f_ca4, np.float64),
+            cat_pad(f_o1, np.float64),
+            cat_pad(f_o2, np.float64),
+            cat_pad(f_c1, np.float64),
+            cat_pad(f_n2, np.float64),
+            cat_pad(f_has_nu, np.bool_),
+            cat_pad(f_has_om, np.bool_),
+            cat_pad(f_tidx, np.int32),
+            cab_tables["pep_tables"],
+            cab_tables["ca_tables"],
+        )
+        cab_f_list = np.asarray(cab_f[:n_f], dtype=np.float64).tolist()
+        ca_f_list = np.asarray(ca_f[:n_f], dtype=np.float64).tolist()
+        vnu_f_list = np.asarray(vnu_f[:n_f], dtype=bool).tolist()
+        for rec, cb_s, ca_s, v_nu in zip(pure_eval_targets, cab_f_list, ca_f_list, vnu_f_list):
+            if v_nu:
+                rec[4] = cb_s
+            rec[5] = ca_s
+
+    alt_owned_by_idx = {}
     if geom_nodes:
         n_g = len(geom_nodes)
         b_g = _next_bucket(n_g)
@@ -1197,91 +1887,95 @@ def cablam(hierarchy, owned):
             if has_om_l[i]:
                 node["omega"] = float(om_np[i])
 
-    # Merge conformers per chain (make_single_results_object) and collect owned CA nodes
-    owned_nodes = []
-    eval_nodes = []
-    ev_mu_in, ev_mu_out, ev_nu, ev_ca_v, ev_tidx = [], [], [], [], []
+    if chains_work:
+        eval_nodes = []
+        ev_mu_in, ev_mu_out, ev_nu, ev_ca_v, ev_tidx = [], [], [], [], []
+        for cw_idx, (conformer_ids, results_by_conformer, all_keys) in enumerate(chains_work):
+            chain_results = []
+            for sid in all_keys:
+                res_node = None
+                found_idx = 0
+                for idx, cname in enumerate(conformer_ids):
+                    if sid in results_by_conformer[cname]:
+                        res_node = results_by_conformer[cname][sid]
+                        found_idx = idx
+                        break
+                found_meaningful_alt = False
+                m_base = (res_node["mu_in"], res_node["mu_out"], res_node["nu"])
+                for other_cname in conformer_ids[found_idx + 1 :]:
+                    if sid in results_by_conformer[other_cname]:
+                        other_node = results_by_conformer[other_cname][sid]
+                        m_other = (other_node["mu_in"], other_node["mu_out"], other_node["nu"])
+                        if m_base != m_other:
+                            chain_results.append(other_node)
+                            found_meaningful_alt = True
+                if not found_meaningful_alt:
+                    res_node["altloc"] = ""
+                chain_results.append(res_node)
 
-    for conformer_ids, results_by_conformer, all_keys in chains_work:
-        chain_results = []
-        for sid in all_keys:
-            res_node = None
-            found_idx = 0
-            for idx, cname in enumerate(conformer_ids):
-                if sid in results_by_conformer[cname]:
-                    res_node = results_by_conformer[cname][sid]
-                    found_idx = idx
-                    break
-            found_meaningful_alt = False
-            m_base = (res_node["mu_in"], res_node["mu_out"], res_node["nu"])
-            for other_cname in conformer_ids[found_idx + 1 :]:
-                if sid in results_by_conformer[other_cname]:
-                    other_node = results_by_conformer[other_cname][sid]
-                    m_other = (other_node["mu_in"], other_node["mu_out"], other_node["nu"])
-                    if m_base != m_other:
-                        chain_results.append(other_node)
-                        found_meaningful_alt = True
-            if not found_meaningful_alt:
-                res_node["altloc"] = ""
-            chain_results.append(res_node)
-
-        chain_results.sort(
-            key=lambda r: (r["chain_id"].rjust(2), _hy36decode(r["resseq"]), r["icode"], r["altloc"])
-        )
-        for r in chain_results:
-            key = (r["chain_id"].strip(), residue_id(r["resseq"], r["icode"]))
-            if r["has_ca"] and owned(*key):
-                r["key"] = key
-                r["cablam_score"] = None
-                r["ca_geom_score"] = None
-                owned_nodes.append(r)
-                rn_up = r["resname"].strip().upper()
-                if rn_up in common_aa and r["mu_in"] is not None and r["mu_out"] is not None:
-                    if r["nu"] is not None or r["ca_virt"] is not None:
-                        if rn_up == "GLY":
-                            t_i = 1
-                        elif rn_up == "PRO":
-                            om = r["omega"]
-                            t_i = 3 if (om is not None and -90.0 <= om <= 90.0) else 2
-                        else:
-                            t_i = 0
-                        eval_nodes.append(r)
-                        ev_mu_in.append(r["mu_in"])
-                        ev_mu_out.append(r["mu_out"])
-                        ev_nu.append(r["nu"] if r["nu"] is not None else 0.0)
-                        ev_ca_v.append(r["ca_virt"] if r["ca_virt"] is not None else 0.0)
-                        ev_tidx.append(t_i)
-
-    if eval_nodes:
-        n_e = len(eval_nodes)
-        b_e = _next_bucket(n_e)
-        pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), b_e))
-        cab_a, ca_a = _cablam_eval_batch_kernel(
-            pad(ev_mu_in, np.float64),
-            pad(ev_mu_out, np.float64),
-            pad(ev_nu, np.float64),
-            pad(ev_ca_v, np.float64),
-            pad(ev_tidx, np.int32),
-            cab_tables["pep_tables"],
-            cab_tables["ca_tables"],
-        )
-        cab_np = np.asarray(cab_a[:n_e], dtype=np.float64)
-        ca_np = np.asarray(ca_a[:n_e], dtype=np.float64)
-        for i, r in enumerate(eval_nodes):
-            if r["nu"] is not None:
-                r["cablam_score"] = float(cab_np[i])
-            if r["ca_virt"] is not None:
-                r["ca_geom_score"] = float(ca_np[i])
-
-    for r in owned_nodes:
-        records.append(
-            r["key"]
-            + (
-                r["resname"].strip(),
-                r["altloc"].strip(),
-                r["cablam_score"],
-                r["ca_geom_score"],
+            chain_results.sort(
+                key=lambda r: (r["chain_id"].rjust(2), _hy36decode(r["resseq"]), r["icode"], r["altloc"])
             )
-        )
+            cw_owned = []
+            for r in chain_results:
+                key = (r["chain_id"].strip(), residue_id(r["resseq"], r["icode"]))
+                if r["has_ca"] and owned(*key):
+                    r["key"] = key
+                    r["cablam_score"] = None
+                    r["ca_geom_score"] = None
+                    cw_owned.append(r)
+                    rn_up = r["resname"].strip().upper()
+                    if rn_up in common_aa and r["mu_in"] is not None and r["mu_out"] is not None:
+                        if r["nu"] is not None or r["ca_virt"] is not None:
+                            if rn_up == "GLY":
+                                t_i = 1
+                            elif rn_up == "PRO":
+                                om = r["omega"]
+                                t_i = 3 if (om is not None and -90.0 <= om <= 90.0) else 2
+                            else:
+                                t_i = 0
+                            eval_nodes.append(r)
+                            ev_mu_in.append(r["mu_in"])
+                            ev_mu_out.append(r["mu_out"])
+                            ev_nu.append(r["nu"] if r["nu"] is not None else 0.0)
+                            ev_ca_v.append(r["ca_virt"] if r["ca_virt"] is not None else 0.0)
+                            ev_tidx.append(t_i)
+            alt_owned_by_idx[cw_idx] = cw_owned
+
+        if eval_nodes:
+            n_e = len(eval_nodes)
+            b_e = _next_bucket(n_e)
+            pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), b_e))
+            cab_a, ca_a = _cablam_eval_batch_kernel(
+                pad(ev_mu_in, np.float64),
+                pad(ev_mu_out, np.float64),
+                pad(ev_nu, np.float64),
+                pad(ev_ca_v, np.float64),
+                pad(ev_tidx, np.int32),
+                cab_tables["pep_tables"],
+                cab_tables["ca_tables"],
+            )
+            cab_np = np.asarray(cab_a[:n_e], dtype=np.float64)
+            ca_np = np.asarray(ca_a[:n_e], dtype=np.float64)
+            for i, r in enumerate(eval_nodes):
+                if r["nu"] is not None:
+                    r["cablam_score"] = float(cab_np[i])
+                if r["ca_virt"] is not None:
+                    r["ca_geom_score"] = float(ca_np[i])
+
+    for kind, payload in pure_owned_lists:
+        if kind == "pure":
+            records.extend(tuple(rec) for rec in payload)
+        else:
+            for r in alt_owned_by_idx.get(payload, ()):
+                records.append(
+                    r["key"]
+                    + (
+                        r["resname"].strip(),
+                        r["altloc"].strip(),
+                        r["cablam_score"],
+                        r["ca_geom_score"],
+                    )
+                )
     return records, classes
 

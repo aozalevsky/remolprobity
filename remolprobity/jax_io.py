@@ -3,6 +3,7 @@ Pure-Python hierarchy reader and adapter matching iotbx.pdb.hierarchy semantics
 (PDB construct_hierarchy, mmCIF pdb_hierarchy_builder, _hd_selection,
 merge_atoms_at_end_to_residues, flip_symmetric_amino_acids, and conformers()).
 """
+import math
 import os
 import numpy as np
 from .io import (
@@ -90,16 +91,48 @@ def _dihedral_deg_single(p0, p1, p2, p3):
     return angle
 
 
+def _dihedral_gt_90_fast(p0, p1, p2, p3):
+    """Fast scalar check for abs(dihedral(p0, p1, p2, p3)) > 90 deg matching scitbx."""
+    d01x, d01y, d01z = p0[0] - p1[0], p0[1] - p1[1], p0[2] - p1[2]
+    d21x, d21y, d21z = p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]
+    d23x, d23y, d23z = p2[0] - p3[0], p2[1] - p3[1], p2[2] - p3[2]
+    n1x = d01y * d21z - d01z * d21y
+    n1y = d01z * d21x - d01x * d21z
+    n1z = d01x * d21y - d01y * d21x
+    n2x = d21y * d23z - d21z * d23y
+    n2y = d21z * d23x - d21x * d23z
+    n2z = d21x * d23y - d21y * d23x
+    n1_sq = n1x * n1x + n1y * n1y + n1z * n1z
+    n2_sq = n2x * n2x + n2y * n2y + n2z * n2z
+    denom = math.sqrt(n1_sq * n2_sq)
+    if denom == 0.0:
+        return False
+    cos_a = max(-1.0, min(1.0, (n1x * n2x + n1y * n2y + n1z * n2z) / denom))
+    return math.acos(cos_a) * (180.0 / math.pi) > 90.0
+
+
+def _chiral_flip_fast(p0, p1, p2, p3):
+    """Fast scalar check for chiral volume flip on VAL/LEU matching iotbx."""
+    d1x, d1y, d1z = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+    d2x, d2y, d2z = p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]
+    d3x, d3y, d3z = p3[0] - p0[0], p3[1] - p0[1], p3[2] - p0[2]
+    cx = d2y * d3z - d2z * d3y
+    cy = d2z * d3x - d2x * d3z
+    cz = d2x * d3y - d2y * d3x
+    vol = d1x * cx + d1y * cy + d1z * cz
+    return abs(-2.5 - vol) > 2.0
+
+
 class JaxAtom:
     __slots__ = ("name", "element", "xyz", "occ", "b", "i_seq", "hetero", "_parent")
 
     def __init__(self, name, element, xyz, occ=1.0, b=0.0, i_seq=0, hetero=False, parent=None):
         self.name = name
         self.element = element
-        self.xyz = tuple(float(c) for c in xyz)
-        self.occ = float(occ)
-        self.b = float(b)
-        self.i_seq = int(i_seq)
+        self.xyz = xyz if type(xyz) is tuple and len(xyz) == 3 else (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+        self.occ = occ if type(occ) is float else float(occ)
+        self.b = b if type(b) is float else float(b)
+        self.i_seq = i_seq if type(i_seq) is int else int(i_seq)
         self.hetero = bool(hetero)
         self._parent = parent
 
@@ -531,10 +564,11 @@ class JaxModel:
 
 
 class JaxHierarchy:
-    __slots__ = ("_models",)
+    __slots__ = ("_models", "_flat_index")
 
     def __init__(self):
         self._models = []
+        self._flat_index = None
 
     def models(self):
         return self._models
@@ -574,6 +608,7 @@ class JaxHierarchy:
         return sum(ch.atoms_size() for ch in self.chains())
 
     def reset_i_seq(self):
+        self._flat_index = None
         for i, a in enumerate(self.atoms()):
             a.i_seq = i
 
@@ -585,6 +620,7 @@ class JaxHierarchy:
 
     def remove_hd_in_place(self):
         """Remove H/D atoms in place without duplicating JaxAtom/JaxResidueGroup objects."""
+        self._flat_index = None
         i_seq = 0
         for m in self._models:
             for ch in list(m._chains):
@@ -648,6 +684,7 @@ class JaxHierarchy:
 
     def merge_atoms_at_end_to_residues(self):
         """Exact replica of iotbx.pdb.hierarchy.root.merge_atoms_at_end_to_residues."""
+        self._flat_index = None
         for model_id, model in enumerate(self._models):
             residues = {}
             for ag in list(model.atom_groups()):
@@ -669,92 +706,76 @@ class JaxHierarchy:
 
     def flip_symmetric_amino_acids(self):
         """Exact replica of iotbx.pdb.hierarchy.root.flip_symmetric_amino_acids."""
-        phe_data = {
-            "dihedral": ["CA", "CB", "CG", "CD1"],
-            "value": [0, 1],
-            "pairs": [
-                ["CD1", "CD2"], ["CE1", "CE2"], ["HD1", "HD2"], ["HE1", "HE2"],
-                ["DD1", "DD2"], ["DE1", "DE2"],
-            ],
-        }
+        self._flat_index = None
+        phe_data = (
+            "dihedral",
+            ("CA", "CB", "CG", "CD1"),
+            (("CD1", "CD2"), ("CE1", "CE2"), ("HD1", "HD2"), ("HE1", "HE2"), ("DD1", "DD2"), ("DE1", "DE2")),
+        )
         data = {
-            "ARG": {
-                "dihedral": ["CD", "NE", "CZ", "NH1"],
-                "value": [0, 1],
-                "pairs": [
-                    ["NH1", "NH2"], ["HH11", "HH21"], ["HH12", "HH22"],
-                    ["DH11", "DH21"], ["DH12", "DH22"],
-                ],
-            },
-            "ASP": {
-                "dihedral": ["CA", "CB", "CG", "OD1"],
-                "value": [0, 1],
-                "pairs": [["OD1", "OD2"]],
-            },
-            "GLU": {
-                "dihedral": ["CB", "CG", "CD", "OE1"],
-                "value": [0, 1],
-                "pairs": [["OE1", "OE2"]],
-            },
+            "ARG": (
+                "dihedral",
+                ("CD", "NE", "CZ", "NH1"),
+                (("NH1", "NH2"), ("HH11", "HH21"), ("HH12", "HH22"), ("DH11", "DH21"), ("DH12", "DH22")),
+            ),
+            "ASP": ("dihedral", ("CA", "CB", "CG", "OD1"), (("OD1", "OD2"),)),
+            "GLU": ("dihedral", ("CB", "CG", "CD", "OE1"), (("OE1", "OE2"),)),
             "PHE": phe_data,
             "TYR": phe_data,
-            "VAL": {
-                "chiral": ["CB", "CA", "CG1", "CG2"],
-                "value": [-2.5, False, 1],
-                "pairs": [
-                    ["CG1", "CG2"], ["HG11", "HG21"], ["HG12", "HG22"], ["HG13", "HG23"],
-                    ["DG11", "DG21"], ["DG12", "DG22"], ["DG13", "DG23"],
-                ],
-            },
-            "LEU": {
-                "chiral": ["CG", "CB", "CD1", "CD2"],
-                "value": [-2.5, False, 1],
-                "pairs": [
-                    ["CD1", "CD2"], ["HD11", "HD21"], ["HD12", "HD22"], ["HD13", "HD23"],
-                    ["DD11", "DD21"], ["DD12", "DD22"], ["DD13", "DD23"],
-                ],
-            },
+            "VAL": (
+                "chiral",
+                ("CB", "CA", "CG1", "CG2"),
+                (
+                    ("CG1", "CG2"),
+                    ("HG11", "HG21"),
+                    ("HG12", "HG22"),
+                    ("HG13", "HG23"),
+                    ("DG11", "DG21"),
+                    ("DG12", "DG22"),
+                    ("DG13", "DG23"),
+                ),
+            ),
+            "LEU": (
+                "chiral",
+                ("CG", "CB", "CD1", "CD2"),
+                (
+                    ("CD1", "CD2"),
+                    ("HD11", "HD21"),
+                    ("HD12", "HD22"),
+                    ("HD13", "HD23"),
+                    ("DD11", "DD21"),
+                    ("DD12", "DD22"),
+                    ("DD13", "DD23"),
+                ),
+            ),
         }
         for rg in self.residue_groups():
             flip_it = False
             for ag in rg._atom_groups:
                 flip_data = data.get(ag.resname)
                 if flip_data is None:
-                    continue
+                    flip_data = data.get(ag.resname.strip())
+                    if flip_data is None:
+                        continue
+                by_name = {a.name.strip(): a for a in ag._atoms}
+                kind, d_names, pairs = flip_data
                 if not flip_it:
-                    if "dihedral" in flip_data:
-                        sites = []
-                        for d in flip_data["dihedral"]:
-                            atom = ag.get_atom(d)
-                            if atom is None:
-                                break
-                            sites.append(np.array(atom.xyz, dtype=np.float64))
-                        if len(sites) != 4:
-                            continue
-                        dih = _dihedral_deg_single(*sites)
-                        if dih is not None and abs(dih) > 90.0:
-                            flip_it = True
-                    elif "chiral" in flip_data:
-                        sites = []
-                        for d in flip_data["chiral"]:
-                            atom = ag.get_atom(d)
-                            if atom is None:
-                                break
-                            sites.append(np.array(atom.xyz, dtype=np.float64))
-                        if len(sites) != 4:
-                            continue
-                        d_01 = sites[1] - sites[0]
-                        d_02 = sites[2] - sites[0]
-                        d_03 = sites[3] - sites[0]
-                        vol_model = float(np.dot(d_01, np.cross(d_02, d_03)))
-                        delta = -2.5 - vol_model
-                        if abs(delta) > 2.0:
-                            flip_it = True
+                    a0 = by_name.get(d_names[0])
+                    a1 = by_name.get(d_names[1])
+                    a2 = by_name.get(d_names[2])
+                    a3 = by_name.get(d_names[3])
+                    if a0 is not None and a1 is not None and a2 is not None and a3 is not None:
+                        if kind == "dihedral":
+                            if _dihedral_gt_90_fast(a0.xyz, a1.xyz, a2.xyz, a3.xyz):
+                                flip_it = True
+                        else:
+                            if _chiral_flip_fast(a0.xyz, a1.xyz, a2.xyz, a3.xyz):
+                                flip_it = True
                 if flip_it:
                     flips_stored = []
-                    for pair in flip_data["pairs"]:
-                        atom1 = ag.get_atom(pair[0])
-                        atom2 = ag.get_atom(pair[1])
+                    for p1_n, p2_n in pairs:
+                        atom1 = by_name.get(p1_n)
+                        atom2 = by_name.get(p2_n)
                         if atom1 is None and atom2 is None:
                             continue
                         if (atom1 is None) != (atom2 is None):
@@ -770,6 +791,7 @@ def _read_cif_hierarchy(path, check=True, zero_occupancy_as_one=False, missing_b
     rows = cif_rows(path)
     tags = next(rows)
     c = _columns(path, tags)
+    values = []
     if check:
         for tag in REQUIRED_COLUMNS:
             if tag not in tags:
@@ -789,6 +811,16 @@ def _read_cif_hierarchy(path, check=True, zero_occupancy_as_one=False, missing_b
     ialt = tags.index("label_alt_id") if "label_alt_id" in tags else None
     ib = tags.index("B_iso_or_equiv") if "B_iso_or_equiv" in tags else None
     igroup = tags.index("group_PDB") if "group_PDB" in tags else None
+    imodel = c["model"]
+    ichain = c["chain"]
+    iseq = c["seq"]
+    icomp = c["comp"]
+    iins = c["ins"]
+    iatom = c["atom"]
+    ielem = c["element"]
+    ix, iy, iz = c["x"], c["y"], c["z"]
+    iocc = c["occ"]
+    seq_tag = tags[iseq]
 
     h = JaxHierarchy()
     model = JaxModel("")
@@ -804,33 +836,29 @@ def _read_cif_hierarchy(path, check=True, zero_occupancy_as_one=False, missing_b
     rg = None
     atom_groups = {}
     i_seq = 0
+    seq_cache = {}
+    resname_cache = {}
+    name_cache = {}
+    dot_q = (".", "?")
+    ins_dot_q = ("?", ".", None)
 
     for r in rows:
-        if c["model"] is not None:
+        if imodel is not None:
+            m_val = r[imodel]
             if first_model_num is None:
-                first_model_num = r[c["model"]]
-            elif r[c["model"]] != first_model_num:
+                first_model_num = m_val
+            elif m_val != first_model_num:
                 raise InputError("%s has more than one model; split them" % path)
-        auth = r[c["chain"]]
-        seq = r[c["seq"]]
-        if auth in (".", "?"):
+        auth = r[ichain]
+        seq = r[iseq]
+        if auth in dot_q:
             raise InputError("%s: atom %s has no chain id" % (path, " ".join(r[:4])))
-        if seq in (".", "?"):
-            raise InputError(
-                "%s: atom %s has no residue number (%s)" % (path, " ".join(r[:4]), tags[c["seq"]])
-            )
-        if check:
-            for idx, _ in values:
-                if r[idx] in (".", "?"):
-                    raise _unreadable(
-                        path,
-                        "%s (residue %s %s %s)" % (" ".join(r[:4]), auth, r[c["comp"]], seq),
-                        [(tag, r[j]) for j, tag in values if r[j] in (".", "?")],
-                    )
+        if seq in dot_q:
+            raise InputError("%s: atom %s has no residue number (%s)" % (path, " ".join(r[:4]), seq_tag))
         label = r[ilabel]
-        comp = r[c["comp"]]
-        ins = r[c["ins"]] if c["ins"] is not None else " "
-        if ins in ("?", ".", None):
+        comp = r[icomp]
+        ins = r[iins] if iins is not None else " "
+        if ins in ins_dot_q:
             ins = " "
 
         new_chain = current_auth is None or _starts_chain(
@@ -841,18 +869,24 @@ def _read_cif_hierarchy(path, check=True, zero_occupancy_as_one=False, missing_b
             model.append_chain(chain)
 
         if new_chain or seq != current_seq or ins != current_ins or auth != current_auth:
-            try:
-                resseq = _hy36encode_4(int(seq))
-            except ValueError:
-                resseq = "%4s" % seq
+            resseq = seq_cache.get(seq)
+            if resseq is None:
+                try:
+                    resseq = _hy36encode_4(int(seq))
+                except ValueError:
+                    resseq = "%4s" % seq
+                seq_cache[seq] = resseq
             rg = JaxResidueGroup(resseq=resseq, icode=ins, link_to_previous=True)
             chain.append_residue_group(rg)
             atom_groups = {}
 
         alt = r[ialt] if ialt is not None else ""
-        if alt in (".", "?"):
+        if alt in dot_q:
             alt = ""
-        resname = "%3s" % comp
+        resname = resname_cache.get(comp)
+        if resname is None:
+            resname = "%3s" % comp
+            resname_cache[comp] = resname
         ag_key = (alt, resname)
         ag = atom_groups.get(ag_key)
         if ag is None:
@@ -863,17 +897,39 @@ def _read_cif_hierarchy(path, check=True, zero_occupancy_as_one=False, missing_b
             else:
                 rg.append_atom_group(ag)
 
-        elem = r[c["element"]] if c["element"] is not None else ""
-        atom_name = format_pdb_atom_name(r[c["atom"]], elem)
-        x, y, z = float(r[c["x"]]), float(r[c["y"]]), float(r[c["z"]])
-        occ_str = r[c["occ"]] if c["occ"] is not None else "1.0"
-        occ = 1.0 if occ_str in (".", "?") else float(occ_str)
+        elem = r[ielem] if ielem is not None else ""
+        raw_atom = r[iatom]
+        ne_pair = name_cache.get((raw_atom, elem))
+        if ne_pair is None:
+            ne_pair = (format_pdb_atom_name(raw_atom, elem), "%2s" % elem)
+            name_cache[(raw_atom, elem)] = ne_pair
+        atom_name, elem_padded = ne_pair
+
+        try:
+            x, y, z = float(r[ix]), float(r[iy]), float(r[iz])
+            occ_str = r[iocc] if iocc is not None else "1.0"
+            occ = float(occ_str)
+            b_str = r[ib] if ib is not None else "0.0"
+            b = float(b_str)
+        except ValueError:
+            if check:
+                for idx, _ in values:
+                    if r[idx] in dot_q:
+                        raise _unreadable(
+                            path,
+                            "%s (residue %s %s %s)" % (" ".join(r[:4]), auth, comp, seq),
+                            [(tag, r[j]) for j, tag in values if r[j] in dot_q],
+                        )
+            x, y, z = float(r[ix]), float(r[iy]), float(r[iz])
+            occ_str = r[iocc] if iocc is not None else "1.0"
+            occ = 1.0 if occ_str in dot_q else float(occ_str)
+            b_str = r[ib] if ib is not None else "0.0"
+            b = 0.0 if b_str in dot_q else float(b_str)
+
         if zero_occupancy_as_one and occ == 0.0:
             occ = 1.0
-        b_str = r[ib] if ib is not None else "0.0"
-        b = 0.0 if b_str in (".", "?") else float(b_str)
         hetero = (igroup is not None) and (r[igroup] == "HETATM")
-        ag.append_atom(JaxAtom(atom_name, "%2s" % elem, (x, y, z), occ, b, i_seq, hetero))
+        ag.append_atom(JaxAtom(atom_name, elem_padded, (x, y, z), occ, b, i_seq, hetero))
         i_seq += 1
 
         current_auth = auth
