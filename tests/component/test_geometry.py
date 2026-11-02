@@ -141,3 +141,72 @@ def test_glycan_link_restraints_are_not_scored(tmp_path):
     # cctbx from 2026-08-19 leaves the glycan links out of the 65 bonds older
     # cctbx scores; either way remolprobity scores what stock does (above)
     assert out['bonds'][1] == (61 if out['scoreable'] else 65)
+
+
+FAST_V34_ORACLE = """
+import json, os, sys
+import numpy as np
+import iotbx.pdb
+from scitbx.array_family import flex
+from remolprobity import blocks, io, jax_geometry
+
+data_dir = sys.argv[1]
+files = ['1crn.pdb', '1ehz_10nt.cif', '4hhb.cif', '9a1n_L_L10.cif', '9a1n_split_chain.cif']
+checked_blocks = 0
+for fname in files:
+    path = os.path.join(data_dir, fname)
+    m = io.read_model(path)
+    plan = blocks.plan_blocks(m, 2000, 25.0)
+    ms = io.model_slice(m)
+    for b, mem in enumerate(plan.members):
+        txt = io.block_text(ms, mem, path='block%05d.%s' % (b, m.format))
+        h1 = iotbx.pdb.input(source_info=None, lines=flex.split_lines(txt)).construct_hierarchy(sort_atoms=False)
+        h2 = h1.deep_copy()
+        fast = jax_geometry._extract_v34_fast(h1)
+        assert fast is not None, (fname, b)
+        # Reference via mmtbx.model.manager (_model)
+        from cctbx import geometry_restraints
+        from remolprobity.geometry import _model
+        from remolprobity.ids import atom_tuple
+        model = _model(h2, 'v34')
+        atoms = model.get_hierarchy().atoms()
+        sites = atoms.extract_xyz()
+        grm = model.get_restraints_manager().geometry
+        bonds = grm.pair_proxies(sites_cart=sites, flags=geometry_restraints.flags.flags(bond=True)).bond_proxies.simple
+        angles = grm.angle_proxies
+        assert fast['atom_tuples'] == [atom_tuple(a.fetch_labels()) for a in atoms], (fname, b)
+        np.testing.assert_allclose(fast['xyz'], np.asarray(sites.as_numpy_array(), dtype=np.float64), atol=1e-12)
+        ref_b = sorted((min(int(p.i_seqs[0]), int(p.i_seqs[1])), max(int(p.i_seqs[0]), int(p.i_seqs[1])),
+                        int(p.origin_id), float(p.distance_ideal), float(p.weight))
+                       for p in bonds if int(p.origin_id) in (0, 2))
+        fast_b = sorted((min(int(ij[0]), int(ij[1])), max(int(ij[0]), int(ij[1])),
+                         int(oid), float(id_v), float(w_v))
+                        for ij, oid, id_v, w_v in zip(fast['bond_iseqs'], fast['bond_origin_id'],
+                                                      fast['bond_ideal'], fast['bond_weight'])
+                        if int(oid) in (0, 2))
+        assert len(ref_b) == len(fast_b), (fname, b, len(ref_b), len(fast_b))
+        for rb, fb in zip(ref_b, fast_b):
+            assert rb[:3] == fb[:3], (fname, b, rb, fb)
+            assert abs(rb[3] - fb[3]) < 1e-10 and abs(rb[4] - fb[4]) < 1e-8, (fname, b, rb, fb)
+        ref_a = sorted((min(int(p.i_seqs[0]), int(p.i_seqs[2])), int(p.i_seqs[1]), max(int(p.i_seqs[0]), int(p.i_seqs[2])),
+                        int(p.origin_id), float(p.angle_ideal), float(p.weight))
+                       for p in angles if int(p.origin_id) in (0, 2))
+        fast_a = sorted((min(int(ijk[0]), int(ijk[2])), int(ijk[1]), max(int(ijk[0]), int(ijk[2])),
+                         int(oid), float(id_v), float(w_v))
+                        for ijk, oid, id_v, w_v in zip(fast['angle_iseqs'], fast['angle_origin_id'],
+                                                       fast['angle_ideal'], fast['angle_weight'])
+                        if int(oid) in (0, 2))
+        assert len(ref_a) == len(fast_a), (fname, b, len(ref_a), len(fast_a))
+        for ra, fa in zip(ref_a, fast_a):
+            assert ra[:4] == fa[:4], (fname, b, ra, fa)
+            assert abs(ra[4] - fa[4]) < 1e-10 and abs(ra[5] - fa[5]) < 1e-8, (fname, b, ra, fa)
+        checked_blocks += 1
+print(json.dumps({'checked_blocks': checked_blocks}))
+"""
+
+
+@pytest.mark.container
+def test_fast_v34_proxy_arrays_match_cctbx_across_blocks():
+    out = json.loads(in_image('-c', FAST_V34_ORACLE, DATA).stdout.strip().splitlines()[-1])
+    assert out['checked_blocks'] >= 10
+
