@@ -151,12 +151,18 @@ from scitbx.array_family import flex
 from remolprobity import blocks, io, jax_geometry
 
 data_dir = sys.argv[1]
-files = ['1crn.pdb', '1ehz_10nt.cif', '4hhb.cif', '9a1n_L_L10.cif', '9a1n_split_chain.cif']
+corpus_dir = sys.argv[2] if len(sys.argv) > 2 else ''
+targets = [(os.path.join(data_dir, f), 2000, 25.0)
+           for f in ('1crn.pdb', '1ehz_10nt.cif', '4hhb.cif', '9a1n_L_L10.cif', '9a1n_split_chain.cif')]
+for cf in ('9a1n_100k.cif', '9a1n_400k.cif'):
+    cpath = os.path.join(corpus_dir, cf)
+    if corpus_dir and os.path.exists(cpath):
+        targets.append((cpath, 20000, 20.0))
 checked_blocks = 0
-for fname in files:
-    path = os.path.join(data_dir, fname)
+for path, block_atoms, margin in targets:
+    fname = os.path.basename(path)
     m = io.read_model(path)
-    plan = blocks.plan_blocks(m, 2000, 25.0)
+    plan = blocks.plan_blocks(m, block_atoms, margin)
     ms = io.model_slice(m)
     for b, mem in enumerate(plan.members):
         txt = io.block_text(ms, mem, path='block%05d.%s' % (b, m.format))
@@ -204,9 +210,11 @@ for fname in files:
 print(json.dumps({'checked_blocks': checked_blocks}))
 """
 
+CORPUS_DIR = os.environ.get('REMOLPROBITY_CORPUS', os.path.expanduser('~/.cache/remolprobity/corpus'))
+
 
 @pytest.mark.container
 def test_fast_v34_proxy_arrays_match_cctbx_across_blocks():
-    out = json.loads(in_image('-c', FAST_V34_ORACLE, DATA).stdout.strip().splitlines()[-1])
+    out = json.loads(in_image('-c', FAST_V34_ORACLE, DATA, CORPUS_DIR).stdout.strip().splitlines()[-1])
     assert out['checked_blocks'] >= 10
 
