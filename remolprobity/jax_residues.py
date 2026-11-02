@@ -6,9 +6,6 @@ import os
 import numpy as np
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
 
 from .ids import residue_id
 from .jax_io import JaxChain, JaxHierarchy, JaxModel, prepare_noh_hierarchy, read_hierarchy, _hy36decode
@@ -22,12 +19,18 @@ from .jax_tables import (
     RAMA_TRANSPRO,
     RAMA_TYPE_NAMES,
     SYM_AA,
+    _get_jax,
+    call_gpu,
     get_cablam_tables,
+    get_cpu_cablam_tables,
+    get_cpu_tables,
     get_tables,
+    lazy_jit,
+    register_gpu_op,
 )
 
 
-@jax.jit
+@lazy_jit()
 def dihedral_angles_jax(p0, p1, p2, p3):
     """
     Vectorized dihedral angle in degrees matching scitbx::math::dihedral_angle
@@ -90,7 +93,7 @@ def _linear_interp_1d(x1, x2, y1, y2, x):
     return a * x + b
 
 
-@jax.jit
+@lazy_jit()
 def rama_eval_batch_jax(
     ca0, c0, n1, ca1, c1, n2, omega_ca0, omega_c0, omega_n1, omega_ca1,
     is_gly, is_pro, is_ile_val, next_is_pro, rama_tables
@@ -141,7 +144,7 @@ def rama_eval_batch_jax(
     return phi, psi, score, rama_type, eval_code
 
 
-@jax.jit
+@lazy_jit()
 def rotamer_eval_batch_jax(
     p0, p1, p2, p3, chi_valid, aa_idx, is_sym,
     rota_flat, rota_offset, rota_ndim, rota_min, rota_max, rota_nbins, rota_dowrap, rota_wbin,
@@ -343,8 +346,8 @@ def _get_static_meta():
     global _STATIC_META
     if _STATIC_META is not None:
         return _STATIC_META
-    tables = get_tables()
-    cab_tables = get_cablam_tables()
+    tables = get_cpu_tables()
+    cab_tables = get_cpu_cablam_tables()
     aa_list = list(tables["aa_list"])
     aa_to_idx = tables["aa_to_idx"]
     chi_atoms_map = tables["chi_atoms"]
@@ -379,16 +382,21 @@ def _get_static_meta():
     return _STATIC_META
 
 
+_LAST_FLAT_INDEX = (None, None, None)
+
+
 def _ensure_flat_index(h):
     """
-    Build and cache a columnar index on JaxHierarchy `h` in a single pass so
-    ramachandran, rotamers, cbeta, omegas, and cablam can execute via vectorized
-    NumPy/JAX array indexing without repeating Python conformer/atom traversals.
+    Build and cache a columnar index on `h` (JaxHierarchy or iotbx.pdb.hierarchy.root)
+    in a single pass so ramachandran, rotamers, cbeta, omegas, and cablam can execute
+    via vectorized NumPy/JAX array indexing without repeating conformer/atom traversals.
     """
-    if not isinstance(h, JaxHierarchy):
-        return None
-    if getattr(h, "_flat_index", None) is not None:
-        return h._flat_index
+    global _LAST_FLAT_INDEX
+    cached = getattr(h, "_flat_index", None)
+    if cached is not None:
+        return cached
+    if _LAST_FLAT_INDEX[0] == id(h) and _LAST_FLAT_INDEX[1] is h:
+        return _LAST_FLAT_INDEX[2]
 
     smeta = _get_static_meta()
     def_to_idx = smeta["def_to_idx"]
@@ -401,28 +409,43 @@ def _ensure_flat_index(h):
     atom_slot_get = _ATOM_SLOT.get
 
     atoms = h.atoms()
-    if not atoms:
-        h._flat_index = {"xyz": np.zeros((0, 3), dtype=np.float64), "occ": np.zeros(0, dtype=np.float64), "chains": {}}
-        return h._flat_index
+    n_atoms = atoms.size() if hasattr(atoms, "size") else len(atoms)
+    if n_atoms == 0:
+        flat_dict = {"xyz": np.zeros((0, 3), dtype=np.float64), "occ": np.zeros(0, dtype=np.float64), "chains": {}}
+        try:
+            h._flat_index = flat_dict
+        except AttributeError:
+            pass
+        _LAST_FLAT_INDEX = (id(h), h, flat_dict)
+        return flat_dict
 
-    xyz = np.array([a.xyz for a in atoms], dtype=np.float64)
-    occ = np.array([a.occ for a in atoms], dtype=np.float64)
+    if hasattr(atoms, "extract_xyz"):
+        xyz = np.asarray(atoms.extract_xyz().as_numpy_array(), dtype=np.float64)
+        occ = np.asarray(atoms.extract_occ().as_numpy_array(), dtype=np.float64)
+    else:
+        xyz = np.array([a.xyz for a in atoms], dtype=np.float64)
+        occ = np.array([a.occ for a in atoms], dtype=np.float64)
 
     resid_cache = {}
     resname_cache = {}
     chains_map = {}
 
     model = h.models()[0]
-    for ch in model.chains():
-        rgs = ch._residue_groups
-        m = len(rgs)
+    for ch_idx, ch in enumerate(model.chains()):
+        rgs = getattr(ch, "_residue_groups", None)
+        if rgs is None:
+            rgs = ch.residue_groups()
+        m = rgs.size() if hasattr(rgs, "size") else len(rgs)
         if m == 0:
             continue
         is_pure = True
         seen_rc = set()
         for rg in rgs:
-            ags = rg._atom_groups
-            if len(ags) != 1 or ags[0].altloc != "":
+            ags = getattr(rg, "_atom_groups", None)
+            if ags is None:
+                ags = rg.atom_groups()
+            n_ags = ags.size() if hasattr(ags, "size") else len(ags)
+            if n_ags != 1 or ags[0].altloc.strip() != "":
                 is_pure = False
                 break
             rc_key = (rg.resseq, rg.icode)
@@ -431,6 +454,7 @@ def _ensure_flat_index(h):
                 break
             seen_rc.add(rc_key)
         if not is_pure:
+            chains_map[ch_idx] = None
             chains_map[id(ch)] = None
             continue
 
@@ -467,7 +491,8 @@ def _ensure_flat_index(h):
             prev_ri = ri
             prev_ic = ic
 
-            ag = rg._atom_groups[0]
+            ags = getattr(rg, "_atom_groups", None)
+            ag = ags[0] if ags is not None else rg.atom_groups()[0]
             raw_rn = ag.resname
             rn_info = resname_cache.get(raw_rn)
             if rn_info is None:
@@ -525,8 +550,11 @@ def _ensure_flat_index(h):
                 resname_cache[raw_rn] = rn_info
 
             rn_s, fl, r_def, r_aa, cb_rt, cab_t, not_hoh, cab_aa, cab_na, cab_unk, chk_na_1 = rn_info
-            ag_atoms = ag._atoms
-            if chk_na_1 and len(ag_atoms) == 1 and ag_atoms[0].name not in _NA_SINGLE_ATOM_VALID:
+            ag_atoms = getattr(ag, "_atoms", None)
+            if ag_atoms is None:
+                ag_atoms = ag.atoms()
+            n_ag_atoms = ag_atoms.size() if hasattr(ag_atoms, "size") else len(ag_atoms)
+            if chk_na_1 and n_ag_atoms == 1 and ag_atoms[0].name not in _NA_SINGLE_ATOM_VALID:
                 if ag_atoms[0].name.strip() not in _NA_SINGLE_ATOM_VALID:
                     not_hoh, cab_aa, cab_na, cab_unk = 1, 0, 0, 0
 
@@ -558,7 +586,7 @@ def _ensure_flat_index(h):
             cab_tidx_list.append(cab_t)
             cab_classes.append((cid_strip, resid_str, not_hoh, cab_aa, cab_na, cab_unk))
 
-        chains_map[id(ch)] = {
+        entry = {
             "cid": cid,
             "cid_strip": cid_strip,
             "m": m,
@@ -577,9 +605,16 @@ def _ensure_flat_index(h):
             "cab_tidx": np.array(cab_tidx_list, dtype=np.int32),
             "cab_classes": cab_classes,
         }
+        chains_map[ch_idx] = entry
+        chains_map[id(ch)] = entry
 
-    h._flat_index = {"xyz": xyz, "occ": occ, "chains": chains_map}
-    return h._flat_index
+    flat_dict = {"xyz": xyz, "occ": occ, "chains": chains_map}
+    try:
+        h._flat_index = flat_dict
+    except AttributeError:
+        pass
+    _LAST_FLAT_INDEX = (id(h), h, flat_dict)
+    return flat_dict
 
 
 def ramachandran(hierarchy):
@@ -594,18 +629,17 @@ def ramachandran(hierarchy):
     xyz_all = flat["xyz"] if flat is not None else None
     chains_flat = flat["chains"] if flat is not None else {}
 
-    tables = get_tables()
     model = h.models()[0]
 
     # Collect unique chain IDs in order of appearance, matching residues.ramachandran
     chain_ids_ordered = []
     chains_by_cid = {}
-    for ch in model.chains():
+    for ch_idx, ch in enumerate(model.chains()):
         cid = ch.id
         if cid not in chains_by_cid:
             chain_ids_ordered.append(cid)
             chains_by_cid[cid] = []
-        chains_by_cid[cid].append(ch)
+        chains_by_cid[cid].append((ch_idx, ch))
 
     triples_meta = []
     ca0_chunks, c0_chunks, n1_chunks, ca1_chunks, c1_chunks, n2_chunks = [], [], [], [], [], []
@@ -617,8 +651,8 @@ def ramachandran(hierarchy):
         uniqueness_keys = set()
         ch_list = chains_by_cid[cid]
         can_skip_sort = len(ch_list) == 1
-        for ch in ch_list:
-            ce = chains_flat.get(id(ch))
+        for ch_idx, ch in ch_list:
+            ce = chains_flat.get(ch_idx)
             if ce is not None:
                 if not ce["is_sorted"]:
                     can_skip_sort = False
@@ -812,9 +846,10 @@ def ramachandran(hierarchy):
 
     n_triples = len(triples_meta)
     bucket_n = _next_bucket(n_triples)
-    cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n))
+    cat_pad = lambda chunks, dt: _pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n)
 
-    phi_arr, psi_arr, score_arr, _, eval_arr = rama_eval_batch_jax(
+    phi_arr, psi_arr, score_arr, eval_arr = call_gpu(
+        "rama_eval",
         cat_pad(ca0_chunks, np.float64),
         cat_pad(c0_chunks, np.float64),
         cat_pad(n1_chunks, np.float64),
@@ -829,7 +864,6 @@ def ramachandran(hierarchy):
         cat_pad(is_pro_chunks, np.bool_),
         cat_pad(is_ile_val_chunks, np.bool_),
         cat_pad(next_is_pro_chunks, np.bool_),
-        tables["rama_tables"],
     )
 
     phi_list = np.asarray(phi_arr[:n_triples], dtype=np.float64).tolist()
@@ -896,7 +930,7 @@ def rotamers(hierarchy):
     chi_req = smeta["chi_req"]
     unit_pts_np = smeta["unit_pts"]
 
-    tables = get_tables()
+    tables = get_cpu_tables()
     aa_to_idx = tables["aa_to_idx"]
     chi_atoms_map = tables["chi_atoms"]
     box_names = tables["box_names"]
@@ -911,8 +945,8 @@ def rotamers(hierarchy):
 
     unit_pts = ((1.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 
-    for ch in model.chains():
-        ce = chains_flat.get(id(ch))
+    for ch_idx, ch in enumerate(model.chains()):
+        ce = chains_flat.get(ch_idx)
         if ce is not None:
             r_def = ce["rota_def_idx"]
             cand = np.flatnonzero(r_def >= 0)
@@ -1019,9 +1053,10 @@ def rotamers(hierarchy):
 
     n_rota = len(meta)
     bucket_n = _next_bucket(n_rota)
-    cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n))
+    cat_pad = lambda chunks, dt: _pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n)
 
-    score_arr, eval_arr, box_arr = rotamer_eval_batch_jax(
+    score_arr, eval_arr, box_arr = call_gpu(
+        "rotamer_eval",
         cat_pad(p0_chunks, np.float64),
         cat_pad(p1_chunks, np.float64),
         cat_pad(p2_chunks, np.float64),
@@ -1029,17 +1064,6 @@ def rotamers(hierarchy):
         cat_pad(chi_valid_chunks, np.bool_),
         cat_pad(aa_idx_chunks, np.int32),
         cat_pad(is_sym_chunks, np.bool_),
-        tables["rota_flat"],
-        tables["rota_offset"],
-        tables["rota_ndim"],
-        tables["rota_min"],
-        tables["rota_max"],
-        tables["rota_nbins"],
-        tables["rota_dowrap"],
-        tables["rota_wbin"],
-        tables["box_low"],
-        tables["box_high"],
-        tables["box_valid"],
     )
 
     score_list = np.asarray(score_arr[:n_rota], dtype=np.float64).tolist()
@@ -1104,7 +1128,7 @@ def _construct_fourth_jax(res0, res1, res2, dist, angle, dihedral):
     return _rotate_point_around_axis_jax(res2, b_axis, new_d, 90.0 - angle)
 
 
-@jax.jit
+@lazy_jit()
 def _cbeta_batch_kernel(res_n, res_ca, res_c, res_cb, res_type, is_common_aa, is_d_aa):
     """
     Vectorized GPU kernel for C-beta deviation and dihedral_NABB
@@ -1163,7 +1187,7 @@ def cbeta(hierarchy):
     occ_all = flat["occ"] if flat is not None else None
     chains_flat = flat["chains"] if flat is not None else {}
 
-    cab_tables = get_cablam_tables()
+    cab_tables = get_cpu_cablam_tables()
     common_aa = cab_tables["common_aa"]
     d_aa = cab_tables["d_aa"]
 
@@ -1172,8 +1196,8 @@ def cbeta(hierarchy):
     n_chunks, ca_chunks, c_chunks, cb_chunks = [], [], [], []
     rtype_chunks, common_chunks, daa_chunks = [], [], []
 
-    for ch in model.chains():
-        ce = chains_flat.get(id(ch))
+    for ch_idx, ch in enumerate(model.chains()):
+        ce = chains_flat.get(ch_idx)
         if ce is not None:
             s_idx = ce["slot_idx"]
             n_i = s_idx[:, 0]
@@ -1254,9 +1278,10 @@ def cbeta(hierarchy):
 
     n_items = len(meta)
     bucket_n = _next_bucket(n_items)
-    cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n))
+    cat_pad = lambda chunks, dt: _pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n)
 
-    dev_arr, dih_arr = _cbeta_batch_kernel(
+    dev_arr, dih_arr = call_gpu(
+        "cbeta_eval",
         cat_pad(n_chunks, np.float64),
         cat_pad(ca_chunks, np.float64),
         cat_pad(c_chunks, np.float64),
@@ -1295,14 +1320,14 @@ def omegas(hierarchy):
     xyz_all = flat["xyz"] if flat is not None else None
     chains_flat = flat["chains"] if flat is not None else {}
 
-    all_aa = get_cablam_tables()["all_aa"]
+    all_aa = get_cpu_cablam_tables()["all_aa"]
     model = h.models()[0]
 
     meta = []
     ca0_chunks, c0_chunks, n1_chunks, ca1_chunks = [], [], [], []
 
-    for ch in model.chains():
-        ce = chains_flat.get(id(ch))
+    for ch_idx, ch in enumerate(model.chains()):
+        ce = chains_flat.get(ch_idx)
         if ce is not None:
             bb_aa = np.flatnonzero(((ce["flags"] & 2) != 0) & ce["has_bb"])
             if len(bb_aa) < 2:
@@ -1409,9 +1434,10 @@ def omegas(hierarchy):
 
     n_items = len(meta)
     bucket_n = _next_bucket(n_items)
-    cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n))
+    cat_pad = lambda chunks, dt: _pad_to(np.concatenate(chunks).astype(dt, copy=False), bucket_n)
 
-    omega_arr = dihedral_angles_jax(
+    omega_arr = call_gpu(
+        "dihedral_angles",
         cat_pad(ca0_chunks, np.float64),
         cat_pad(c0_chunks, np.float64),
         cat_pad(n1_chunks, np.float64),
@@ -1482,7 +1508,7 @@ def _ndt_interp_3d_jax(tables_3d, t_idx, x0, x1, x2, min2, nbins2):
     return res
 
 
-@jax.jit
+@lazy_jit()
 def _cablam_geom_batch_kernel(
     ca0, ca1, ca2, ca3, ca4, o1, o2, c1, n2,
     has_ca_3, has_mu_in, has_mu_out, has_nu_in, has_omega
@@ -1522,7 +1548,7 @@ def _cablam_geom_batch_kernel(
     return mu_in, mu_out, nu, ca_virt, omega, valid_nu
 
 
-@jax.jit
+@lazy_jit()
 def _cablam_eval_batch_kernel(mu_in, mu_out, nu, ca_virt, t_idx, pep_tables, ca_tables):
     """Vectorized 3D trilinear contour evaluation for CaBLAM and CA-geom."""
     cab_score = _ndt_interp_3d_jax(pep_tables, t_idx, mu_in, mu_out, nu, -180.0, 120)
@@ -1530,7 +1556,7 @@ def _cablam_eval_batch_kernel(mu_in, mu_out, nu, ca_virt, t_idx, pep_tables, ca_
     return cab_score, ca_score
 
 
-@jax.jit
+@lazy_jit()
 def _cablam_fused_batch_kernel(
     ca0, ca1, ca2, ca3, ca4, o1, o2, c1, n2,
     has_nu_in, has_omega, base_tidx, pep_tables, ca_tables
@@ -1581,7 +1607,7 @@ def cablam(hierarchy, owned):
     xyz_all = flat["xyz"] if flat is not None else None
     chains_flat = flat["chains"] if flat is not None else {}
 
-    cab_tables = get_cablam_tables()
+    cab_tables = get_cpu_cablam_tables()
     common_aa = cab_tables["common_aa"]
     all_aa = cab_tables["all_aa"]
     all_na = cab_tables["all_na"]
@@ -1609,8 +1635,8 @@ def cablam(hierarchy, owned):
     u1_np = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     u3_np = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
-    for chain in model.chains():
-        ce = chains_flat.get(id(chain))
+    for ch_idx, chain in enumerate(model.chains()):
+        ce = chains_flat.get(ch_idx)
         if ce is not None:
             cid = ce["cid_strip"]
             resids = ce["resids"]
@@ -1822,8 +1848,9 @@ def cablam(hierarchy, owned):
     if pure_eval_targets:
         n_f = len(pure_eval_targets)
         b_f = _next_bucket(n_f)
-        cat_pad = lambda chunks, dt: jnp.asarray(_pad_to(np.concatenate(chunks).astype(dt, copy=False), b_f))
-        cab_f, ca_f, vnu_f = _cablam_fused_batch_kernel(
+        cat_pad = lambda chunks, dt: _pad_to(np.concatenate(chunks).astype(dt, copy=False), b_f)
+        cab_f, ca_f, vnu_f = call_gpu(
+            "cablam_fused",
             cat_pad(f_ca0, np.float64),
             cat_pad(f_ca1, np.float64),
             cat_pad(f_ca2, np.float64),
@@ -1836,8 +1863,6 @@ def cablam(hierarchy, owned):
             cat_pad(f_has_nu, np.bool_),
             cat_pad(f_has_om, np.bool_),
             cat_pad(f_tidx, np.int32),
-            cab_tables["pep_tables"],
-            cab_tables["ca_tables"],
         )
         cab_f_list = np.asarray(cab_f[:n_f], dtype=np.float64).tolist()
         ca_f_list = np.asarray(ca_f[:n_f], dtype=np.float64).tolist()
@@ -1851,8 +1876,9 @@ def cablam(hierarchy, owned):
     if geom_nodes:
         n_g = len(geom_nodes)
         b_g = _next_bucket(n_g)
-        pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), b_g))
-        mu_in_a, mu_out_a, nu_a, ca_v_a, om_a, val_nu_a = _cablam_geom_batch_kernel(
+        pad = lambda lst, dt: _pad_to(np.asarray(lst, dtype=dt), b_g)
+        mu_in_a, mu_out_a, nu_a, ca_v_a, om_a, val_nu_a = call_gpu(
+            "cablam_geom",
             pad(ca0_l, np.float64),
             pad(ca1_l, np.float64),
             pad(ca2_l, np.float64),
@@ -1945,15 +1971,14 @@ def cablam(hierarchy, owned):
         if eval_nodes:
             n_e = len(eval_nodes)
             b_e = _next_bucket(n_e)
-            pad = lambda lst, dt: jnp.asarray(_pad_to(np.asarray(lst, dtype=dt), b_e))
-            cab_a, ca_a = _cablam_eval_batch_kernel(
+            pad = lambda lst, dt: _pad_to(np.asarray(lst, dtype=dt), b_e)
+            cab_a, ca_a = call_gpu(
+                "cablam_eval",
                 pad(ev_mu_in, np.float64),
                 pad(ev_mu_out, np.float64),
                 pad(ev_nu, np.float64),
                 pad(ev_ca_v, np.float64),
                 pad(ev_tidx, np.int32),
-                cab_tables["pep_tables"],
-                cab_tables["ca_tables"],
             )
             cab_np = np.asarray(cab_a[:n_e], dtype=np.float64)
             ca_np = np.asarray(ca_a[:n_e], dtype=np.float64)
@@ -1978,4 +2003,169 @@ def cablam(hierarchy, owned):
                     )
                 )
     return records, classes
+
+
+@register_gpu_op("dihedral_angles")
+def _dihedral_angles_op(p0, p1, p2, p3):
+    _, jnp_mod = _get_jax()
+    res = dihedral_angles_jax(
+        jnp_mod.asarray(p0, dtype=jnp_mod.float64),
+        jnp_mod.asarray(p1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(p2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(p3, dtype=jnp_mod.float64),
+    )
+    return np.asarray(res, dtype=np.float64)
+
+
+@register_gpu_op("rama_eval")
+def _rama_eval_op(
+    ca0, c0, n1, ca1, c1, n2, om_ca0, om_c0, om_n1, om_ca1,
+    is_gly, is_pro, is_ile_val, next_is_pro,
+):
+    _, jnp_mod = _get_jax()
+    tables = get_tables()
+    phi_arr, psi_arr, score_arr, _, eval_arr = rama_eval_batch_jax(
+        jnp_mod.asarray(ca0, dtype=jnp_mod.float64),
+        jnp_mod.asarray(c0, dtype=jnp_mod.float64),
+        jnp_mod.asarray(n1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(c1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(n2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(om_ca0, dtype=jnp_mod.float64),
+        jnp_mod.asarray(om_c0, dtype=jnp_mod.float64),
+        jnp_mod.asarray(om_n1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(om_ca1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(is_gly, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(is_pro, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(is_ile_val, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(next_is_pro, dtype=jnp_mod.bool_),
+        tables["rama_tables"],
+    )
+    return (
+        np.asarray(phi_arr, dtype=np.float64),
+        np.asarray(psi_arr, dtype=np.float64),
+        np.asarray(score_arr, dtype=np.float64),
+        np.asarray(eval_arr, dtype=np.int32),
+    )
+
+
+@register_gpu_op("rotamer_eval")
+def _rotamer_eval_op(p0, p1, p2, p3, chi_valid, aa_idx, is_sym):
+    _, jnp_mod = _get_jax()
+    tables = get_tables()
+    score_arr, eval_arr, box_arr = rotamer_eval_batch_jax(
+        jnp_mod.asarray(p0, dtype=jnp_mod.float64),
+        jnp_mod.asarray(p1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(p2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(p3, dtype=jnp_mod.float64),
+        jnp_mod.asarray(chi_valid, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(aa_idx, dtype=jnp_mod.int32),
+        jnp_mod.asarray(is_sym, dtype=jnp_mod.bool_),
+        tables["rota_flat"],
+        tables["rota_offset"],
+        tables["rota_ndim"],
+        tables["rota_min"],
+        tables["rota_max"],
+        tables["rota_nbins"],
+        tables["rota_dowrap"],
+        tables["rota_wbin"],
+        tables["box_low"],
+        tables["box_high"],
+        tables["box_valid"],
+    )
+    return (
+        np.asarray(score_arr, dtype=np.float64),
+        np.asarray(eval_arr, dtype=np.int32),
+        np.asarray(box_arr, dtype=np.int32),
+    )
+
+
+@register_gpu_op("cbeta_eval")
+def _cbeta_eval_op(n, ca, c, cb, rtype, common, daa):
+    _, jnp_mod = _get_jax()
+    dev_arr, dih_arr = _cbeta_batch_kernel(
+        jnp_mod.asarray(n, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca, dtype=jnp_mod.float64),
+        jnp_mod.asarray(c, dtype=jnp_mod.float64),
+        jnp_mod.asarray(cb, dtype=jnp_mod.float64),
+        jnp_mod.asarray(rtype, dtype=jnp_mod.int32),
+        jnp_mod.asarray(common, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(daa, dtype=jnp_mod.bool_),
+    )
+    return np.asarray(dev_arr, dtype=np.float64), np.asarray(dih_arr, dtype=np.float64)
+
+
+@register_gpu_op("cablam_fused")
+def _cablam_fused_op(ca0, ca1, ca2, ca3, ca4, o1, o2, c1, n2, has_nu, has_om, tidx):
+    _, jnp_mod = _get_jax()
+    cab_tables = get_cablam_tables()
+    cab_f, ca_f, vnu_f = _cablam_fused_batch_kernel(
+        jnp_mod.asarray(ca0, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca3, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca4, dtype=jnp_mod.float64),
+        jnp_mod.asarray(o1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(o2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(c1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(n2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(has_nu, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(has_om, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(tidx, dtype=jnp_mod.int32),
+        cab_tables["pep_tables"],
+        cab_tables["ca_tables"],
+    )
+    return (
+        np.asarray(cab_f, dtype=np.float64),
+        np.asarray(ca_f, dtype=np.float64),
+        np.asarray(vnu_f, dtype=bool),
+    )
+
+
+@register_gpu_op("cablam_geom")
+def _cablam_geom_op(
+    ca0, ca1, ca2, ca3, ca4, o1, o2, c1, n2,
+    has_ca3, has_mu_in, has_mu_out, has_nu, has_om,
+):
+    _, jnp_mod = _get_jax()
+    mu_in, mu_out, nu, ca_v, om, val_nu = _cablam_geom_batch_kernel(
+        jnp_mod.asarray(ca0, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca3, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca4, dtype=jnp_mod.float64),
+        jnp_mod.asarray(o1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(o2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(c1, dtype=jnp_mod.float64),
+        jnp_mod.asarray(n2, dtype=jnp_mod.float64),
+        jnp_mod.asarray(has_ca3, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(has_mu_in, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(has_mu_out, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(has_nu, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(has_om, dtype=jnp_mod.bool_),
+    )
+    return (
+        np.asarray(mu_in, dtype=np.float64),
+        np.asarray(mu_out, dtype=np.float64),
+        np.asarray(nu, dtype=np.float64),
+        np.asarray(ca_v, dtype=np.float64),
+        np.asarray(om, dtype=np.float64),
+        np.asarray(val_nu, dtype=bool),
+    )
+
+
+@register_gpu_op("cablam_eval")
+def _cablam_eval_op(mu_in, mu_out, nu, ca_v, tidx):
+    _, jnp_mod = _get_jax()
+    cab_tables = get_cablam_tables()
+    cab_a, ca_a = _cablam_eval_batch_kernel(
+        jnp_mod.asarray(mu_in, dtype=jnp_mod.float64),
+        jnp_mod.asarray(mu_out, dtype=jnp_mod.float64),
+        jnp_mod.asarray(nu, dtype=jnp_mod.float64),
+        jnp_mod.asarray(ca_v, dtype=jnp_mod.float64),
+        jnp_mod.asarray(tidx, dtype=jnp_mod.int32),
+        cab_tables["pep_tables"],
+        cab_tables["ca_tables"],
+    )
+    return np.asarray(cab_a, dtype=np.float64), np.asarray(ca_a, dtype=np.float64)
 

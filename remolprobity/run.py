@@ -34,6 +34,9 @@ WORKER_BASE_GB, WORKER_GB_PER_ATOM = 0.3, 12e-6
 # model on loading them (9A1N subsets of 100k and 200k atoms)
 WORKER_GB_PER_MODEL_RESIDUE = 0.5e-6
 MAIN_BASE_GB, MAIN_GB_PER_ATOM = 0.6, 6e-8
+# When --gpu is enabled, a single persistent GPU server process holds the
+# CUDA context, compiled XLA kernels and static tables (~0.82 GB RSS)
+GPU_SERVER_GB = 1.0
 # a worker's problems with the data, reported by their message (the traceback kept in the workdir)
 KNOWN = (io.InputError,)
 PRELOAD = ('iotbx.pdb', 'mmtbx.model', 'mmtbx.validation.ramalyze', 'mmtbx.validation.rotalyze',
@@ -48,17 +51,17 @@ def worker_gb(atoms, model_residues=0):
     return WORKER_BASE_GB + WORKER_GB_PER_ATOM * atoms + WORKER_GB_PER_MODEL_RESIDUE * model_residues
 
 
-def main_gb(n_atoms):
+def main_gb(n_atoms, gpu=False):
     """The expected peak of the main process on a model of this many atoms (GB)"""
-    return MAIN_BASE_GB + MAIN_GB_PER_ATOM * n_atoms
+    return MAIN_BASE_GB + MAIN_GB_PER_ATOM * n_atoms + (GPU_SERVER_GB if gpu else 0.0)
 
 
-def expected_gb(sizes, workers, n_atoms, n_residues):
+def expected_gb(sizes, workers, n_atoms, n_residues, gpu=False):
     """
-    The expected peak of a run (GB): its main process, and workers running
-    the largest of these blocks (atoms each, core and margin) at once
+    The expected peak of a run (GB): its main process (and GPU server if enabled),
+    and workers running the largest of these blocks (atoms each, core and margin) at once
     """
-    return main_gb(n_atoms) + sum(worker_gb(s, n_residues) for s in sorted(sizes, reverse=True)[:workers])
+    return main_gb(n_atoms, gpu=gpu) + sum(worker_gb(s, n_residues) for s in sorted(sizes, reverse=True)[:workers])
 
 
 def available_cpus():
@@ -69,7 +72,7 @@ def available_cpus():
         return os.cpu_count() or 1
 
 
-def choose_workers(sizes, n_atoms, n_residues, memory_gb=None, nproc=None, cpus=1):
+def choose_workers(sizes, n_atoms, n_residues, memory_gb=None, nproc=None, cpus=1, gpu=False):
     """
     Workers for blocks of these sizes (atoms each, core and margin, as
     planned) and the expected peak (GB). nproc if given; else, with
@@ -80,10 +83,10 @@ def choose_workers(sizes, n_atoms, n_residues, memory_gb=None, nproc=None, cpus=
         nproc = cpus
         if memory_gb is not None:
             nproc = min(nproc, len(sizes))
-            while nproc > 1 and expected_gb(sizes, nproc, n_atoms, n_residues) > memory_gb:
+            while nproc > 1 and expected_gb(sizes, nproc, n_atoms, n_residues, gpu=gpu) > memory_gb:
                 nproc -= 1
     nproc = max(1, min(nproc, len(sizes)))  # no idle workers
-    return nproc, expected_gb(sizes, nproc, n_atoms, n_residues)
+    return nproc, expected_gb(sizes, nproc, n_atoms, n_residues, gpu=gpu)
 
 
 def file_sha256(path):
@@ -281,7 +284,7 @@ def _run(a):
     plan = blocks.plan_blocks(model, block_atoms, a.margin)
     sizes = plan.sizes(model)
     nproc, expected = choose_workers(sizes, model.n_atoms, len(model.residues), budget.gb, a.nproc,
-                                     available_cpus())
+                                     available_cpus(), gpu=a.gpu)
     log('%d atoms, %d residues: %d blocks (%.2fx the model, the largest %d atoms), %d workers, about %.1f GB'
         % (model.n_atoms, len(model.residues), plan.n_blocks, sum(sizes) / model.n_atoms, max(sizes), nproc,
            expected))
@@ -336,94 +339,111 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
     """The run, once its workdir exists"""
     from . import naming, tools, worker
 
-    hashes, commit = tool_hashes(t), cctbx_commit()
-    # whatever can change a block's result: input, parameters, tools, code
-    params = {'block_atoms': block_atoms, 'margin': a.margin, 'geometry': definitions,
-              'zero_occupancy_as_one': a.zero_occupancy_as_one, 'missing_b_as_zero': a.missing_b_as_zero,
-              'reduce': t.reduce, 'probe': t.probe,
-              'tools': hashes, 'cctbx': commit, 'remolprobity': __version__}
-    key = _plan_key(model, params)
-    plan_file = os.path.join(work, 'plan.json')
-    if os.path.exists(plan_file):
-        if not a.resume:
-            raise RuntimeError('%s holds a previous run; use --resume or another --workdir' % work)
-        with open(plan_file) as f:
-            previous = json.load(f)
-        if previous['key'] != key:
-            raise RuntimeError('the input, the parameters, the tools or the code changed since the run in %s'
-                               % work)
-        created = previous.get('created', created)
-    elif a.resume:
-        raise RuntimeError('nothing to resume in %s' % work)
+    gpu_srv = None
+    if a.gpu:
+        from . import jax_tables
+        gpu_srv = jax_tables.GPUServer(work).start()
+        log('GPU server started on %s (%s)' % (gpu_srv.info['backend'], gpu_srv.info['device']))
+    try:
+        hashes, commit = tool_hashes(t), cctbx_commit()
+        # whatever can change a block's result: input, parameters, tools, code
+        params = {'block_atoms': block_atoms, 'margin': a.margin, 'geometry': definitions,
+                  'zero_occupancy_as_one': a.zero_occupancy_as_one, 'missing_b_as_zero': a.missing_b_as_zero,
+                  'gpu': a.gpu, 'reduce': t.reduce, 'probe': t.probe,
+                  'tools': hashes, 'cctbx': commit, 'remolprobity': __version__}
+        if gpu_srv is not None:
+            params['jax_tables'] = gpu_srv.info['tables']
+        key = _plan_key(model, params)
+        plan_file = os.path.join(work, 'plan.json')
+        if os.path.exists(plan_file):
+            if not a.resume:
+                raise RuntimeError('%s holds a previous run; use --resume or another --workdir' % work)
+            with open(plan_file) as f:
+                previous = json.load(f)
+            if previous['key'] != key:
+                raise RuntimeError('the input, the parameters, the tools or the code changed since the run in %s'
+                                   % work)
+            created = previous.get('created', created)
+        elif a.resume:
+            raise RuntimeError('nothing to resume in %s' % work)
 
-    check = tools.self_check(t, os.path.join(work, 'scratch'))
-    # only a run asked for as one block may go on: a default run that
-    # happens to fit one block would change behaviour with the model's size
-    if not check['passed'] and block_atoms != 0:
-        raise RuntimeError('reduce failed the self-check (orientation %s vs %s): its results depend on '
-                           'unrelated parts of the model, so blocks would not match a whole-model run; '
-                           'use a reduce with the clique-order patch, or --block-atoms 0'
-                           % (check['near'], check['far']))
+        check = tools.self_check(t, os.path.join(work, 'scratch'))
+        # only a run asked for as one block may go on: a default run that
+        # happens to fit one block would change behaviour with the model's size
+        if not check['passed'] and block_atoms != 0:
+            raise RuntimeError('reduce failed the self-check (orientation %s vs %s): its results depend on '
+                               'unrelated parts of the model, so blocks would not match a whole-model run; '
+                               'use a reduce with the clique-order patch, or --block-atoms 0'
+                               % (check['near'], check['far']))
 
-    block_dir = os.path.join(work, 'blocks')
-    os.makedirs(block_dir, exist_ok=True)
-    if os.path.exists(plan_file):
-        ext = '.cif' if model.format == 'cif' else '.pdb'
-        paths = [os.path.join(block_dir, 'block%05d%s' % (b, ext)) for b in range(plan.n_blocks)]
-    else:
-        paths = io.write_blocks(model, plan.members, block_dir, a.zero_occupancy_as_one,
-                                missing_b_as_zero=a.missing_b_as_zero)
-        with open(plan_file, 'w') as f:
-            json.dump({'key': key, 'blocks': plan.n_blocks, 'created': created}, f)
-    shared = os.path.join(work, 'shared.pkl')
-    with open(shared, 'wb') as f:
-        pickle.dump({'owner': {k: int(o) for k, o in zip(model.residues, plan.owner)},
-                     'conversion': naming.conversion(model.chain_ids, model.residue_names),
-                     'occupancy_max': 1.0 if a.zero_occupancy_as_one and not model.occupancy_max
-                     else model.occupancy_max,
-                     'stretch': {k: int(v) for k, v in zip(model.residues, io.stretches(model))},
-                     'tools': t, 'definitions': definitions, 'margin': a.margin, 'gpu': a.gpu}, f, protocol=4)
-    order = sorted(range(plan.n_blocks), key=lambda b: -sizes[b])
-    tasks = [{'block': b, 'path': paths[b], 'workdir': work, 'shared': shared} for b in order]
-    block_results = schedule.run_tasks(worker.run_block, tasks, nproc, timeout=a.block_timeout,
-                                       store=os.path.join(work, 'results'), log=log, preload=PRELOAD,
-                                       describe=describe, known=KNOWN)
-    # A block whose core needs more margin than it has (a reduce clique or a
-    # clash reaching too near its edge) runs again with what it asks for:
-    # same core, so the same residues owned, and its own checks certify it.
-    # Each margin has its own block files and results store.
-    retried, members = {}, list(plan.members)
-    atom_owner = plan.owner[model.res_of]
-    residue_atoms = model.atoms_per_residue()
-    at = {br['block']: i for i, br in enumerate(block_results)}
-    while True:
-        again = retry_margins(block_results, retried, a.margin)
-        if not again:
-            break
-        todo = sorted(again)
-        for b in todo:
-            members[b] = blocks.block_members(model, plan.owner, b, again[b], atom_owner)
-        blocks.check_neighbours(blocks.Plan(plan.owner, members, a.margin, block_atoms), model)
-        # larger than the first round planned for: say how large, and warn against the budget
-        size = {b: int(residue_atoms[members[b]].sum()) for b in todo}
-        for b in todo:
-            log('block %d needs a margin of %d Å: running it again, %d atoms, about %.1f GB'
-                % (b, again[b], size[b], worker_gb(size[b], len(model.residues))))
-        # all of them in one round, with up to nproc workers, fewer if their larger blocks need it
-        workers, peak = choose_workers(list(size.values()), model.n_atoms, len(model.residues), budget_gb,
-                                       cpus=nproc)
-        if budget_gb is not None and peak > budget_gb:
-            log('warning: blocks run again with larger margins may need %.1f GB, more than the memory budget of '
-                '%.1f GB' % (peak, budget_gb))
-        # one pass over the model for all of them; each margin has its own results store
-        path = dict(zip(todo, io.write_blocks(model, [members[b] for b in todo], block_dir, a.zero_occupancy_as_one,
-                                              names=['block%05d.m%d' % (b, again[b]) for b in todo],
-                                              missing_b_as_zero=a.missing_b_as_zero)))
-        for br in schedule.run_tasks(worker.run_block, retry_tasks(again, size, path, work, shared), workers,
-                                     timeout=a.block_timeout, log=log, preload=PRELOAD, describe=describe,
-                                     known=KNOWN):
-            block_results[at[br['block']]] = br
-        retried.update(again)
+        block_dir = os.path.join(work, 'blocks')
+        os.makedirs(block_dir, exist_ok=True)
+        if os.path.exists(plan_file):
+            ext = '.cif' if model.format == 'cif' else '.pdb'
+            paths = [os.path.join(block_dir, 'block%05d%s' % (b, ext)) for b in range(plan.n_blocks)]
+        else:
+            paths = io.write_blocks(model, plan.members, block_dir, a.zero_occupancy_as_one,
+                                    missing_b_as_zero=a.missing_b_as_zero)
+            with open(plan_file, 'w') as f:
+                json.dump({'key': key, 'blocks': plan.n_blocks, 'created': created}, f)
+        shared = os.path.join(work, 'shared.pkl')
+        with open(shared, 'wb') as f:
+            pickle.dump({'owner': {k: int(o) for k, o in zip(model.residues, plan.owner)},
+                         'conversion': naming.conversion(model.chain_ids, model.residue_names),
+                         'occupancy_max': 1.0 if a.zero_occupancy_as_one and not model.occupancy_max
+                         else model.occupancy_max,
+                         'stretch': {k: int(v) for k, v in zip(model.residues, io.stretches(model))},
+                         'tools': t, 'definitions': definitions, 'margin': a.margin, 'gpu': a.gpu,
+                         'gpu_sock': gpu_srv.sock_path if gpu_srv is not None else None}, f, protocol=4)
+        order = sorted(range(plan.n_blocks), key=lambda b: -sizes[b])
+        tasks = [{'block': b, 'path': paths[b], 'workdir': work, 'shared': shared} for b in order]
+        block_results = schedule.run_tasks(worker.run_block, tasks, nproc, timeout=a.block_timeout,
+                                           store=os.path.join(work, 'results'), log=log, preload=PRELOAD,
+                                           describe=describe, known=KNOWN)
+        # A block whose core needs more margin than it has (a reduce clique or a
+        # clash reaching too near its edge) runs again with what it asks for:
+        # same core, so the same residues owned, and its own checks certify it.
+        # Each margin has its own block files and results store.
+        retried, members = {}, list(plan.members)
+        atom_owner = plan.owner[model.res_of]
+        residue_atoms = model.atoms_per_residue()
+        at = {br['block']: i for i, br in enumerate(block_results)}
+        while True:
+            again = retry_margins(block_results, retried, a.margin)
+            if not again:
+                break
+            todo = sorted(again)
+            for b in todo:
+                members[b] = blocks.block_members(model, plan.owner, b, again[b], atom_owner)
+            blocks.check_neighbours(blocks.Plan(plan.owner, members, a.margin, block_atoms), model)
+            # larger than the first round planned for: say how large, and warn against the budget
+            size = {b: int(residue_atoms[members[b]].sum()) for b in todo}
+            for b in todo:
+                log('block %d needs a margin of %d Å: running it again, %d atoms, about %.1f GB'
+                    % (b, again[b], size[b], worker_gb(size[b], len(model.residues))))
+            # all of them in one round, with up to nproc workers, fewer if their larger blocks need it
+            workers, peak = choose_workers(list(size.values()), model.n_atoms, len(model.residues), budget_gb,
+                                           cpus=nproc, gpu=a.gpu)
+            if budget_gb is not None and peak > budget_gb:
+                log('warning: blocks run again with larger margins may need %.1f GB, more than the memory budget of '
+                    '%.1f GB' % (peak, budget_gb))
+            # one pass over the model for all of them; each margin has its own results store
+            path = dict(zip(todo, io.write_blocks(model, [members[b] for b in todo], block_dir, a.zero_occupancy_as_one,
+                                                  names=['block%05d.m%d' % (b, again[b]) for b in todo],
+                                                  missing_b_as_zero=a.missing_b_as_zero)))
+            for br in schedule.run_tasks(worker.run_block, retry_tasks(again, size, path, work, shared), workers,
+                                         timeout=a.block_timeout, log=log, preload=PRELOAD, describe=describe,
+                                         known=KNOWN):
+                block_results[at[br['block']]] = br
+            retried.update(again)
+        gpu_peak_gb = gpu_srv.stop() if gpu_srv is not None else 0.0
+    finally:
+        if gpu_srv is not None:
+            gpu_srv.stop()
+    peak_gb = {'main': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
+               'worker': max(br['peak_gb'] for br in block_results)}
+    if gpu_srv is not None:
+        peak_gb['gpu_server'] = gpu_peak_gb
     provenance = {
         'remolprobity': __version__, 'cctbx': commit, 'tools': hashes,
         'reduce': t.reduce_version, 'probe': t.probe_version, 'reduce_self_check': check,
@@ -434,18 +454,20 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
                    'overhead': plan.overhead(model), 'workers': nproc,
                    'retried': {int(b): int(m) for b, m in sorted(retried.items())}},
         'geometry': definitions, 'deviations': list(result.DEVIATIONS if check['passed'] else result.DEVIATIONS[1:]),
-        'options': {'zero_occupancy_as_one': a.zero_occupancy_as_one, 'missing_b_as_zero': a.missing_b_as_zero},
+        'options': {'zero_occupancy_as_one': a.zero_occupancy_as_one, 'missing_b_as_zero': a.missing_b_as_zero,
+                    'gpu': a.gpu},
         'wall_seconds': time.time() - t0,
-        'peak_gb': {'main': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
-                    'worker': max(br['peak_gb'] for br in block_results)},
+        'peak_gb': peak_gb,
     }
+    if gpu_srv is not None:
+        provenance['gpu'] = gpu_srv.info
     r = result.merge(model, block_results, definitions, provenance)
     result.write(r, a.output, out=a.stdout)
     log('done in %s: clashscore %.2f, %d Ramachandran outliers, %d rotamer outliers'
         % (duration(time.time() - t0), r['clashes']['clashscore'], r['ramachandran']['outliers'],
            r['rotamers']['outliers']))
     # a block resumed from the store of an earlier remolprobity may lack its reduce's and probe's peak
-    log(memory_summary(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
+    log(memory_summary(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6 + gpu_peak_gb,
                        [(br['peak_gb'], br.get('children_peak_gb', 0.0)) for br in block_results], nproc))
     if not a.keep_workdir:
         if created:

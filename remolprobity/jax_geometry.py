@@ -6,15 +6,19 @@ import functools
 import json
 import os
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 from .ids import atom_tuple, residue_key
 from .io import InputError
 from .jax_residues import _next_bucket, dihedral_angles_jax
-
-jax.config.update("jax_enable_x64", True)
+from .jax_tables import (
+    _get_jax,
+    build_cdl_npz,
+    call_gpu,
+    default_cdl_path,
+    lazy_jit,
+    register_gpu_op,
+)
 
 DEFINITIONS = ('v34', 'v33')
 V34_CUTOFF = 5.0
@@ -37,10 +41,7 @@ V33_COVALENT_ORIGIN_IDS = (
 V33_OUTLIER_ORIGIN_ID = 0
 EDITS_ORIGIN_ID = 4
 
-DEFAULT_CDL_NPZ_PATH = os.environ.get(
-    "REMOLPROBITY_JAX_CDL",
-    os.path.expanduser("~/.cache/remolprobity/jax_cdl.npz"),
-)
+DEFAULT_CDL_NPZ_PATH = default_cdl_path()
 
 CDL_COLUMNS = (
     "", "",
@@ -68,13 +69,11 @@ CDL_COLUMNS = (
 
 
 @functools.lru_cache(maxsize=1)
-def get_cdl_tables(npz_path=DEFAULT_CDL_NPZ_PATH):
-    """Load the Conformation-Dependent Library (CDL) tables onto GPU."""
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(
-            f"JAX CDL table archive not found at {npz_path}. "
-            "Run remolprobity.jax_geometry.build_cdl_npz() in the cctbx environment."
-        )
+def get_cpu_cdl_tables(npz_path=None):
+    """Load the Conformation-Dependent Library (CDL) metadata and NumPy tables without importing JAX."""
+    npz_path = npz_path or default_cdl_path()
+    if not os.path.isfile(npz_path):
+        build_cdl_npz(npz_path, only_if_missing=True)
     data = np.load(npz_path, allow_pickle=False)
     group_names = json.loads(str(data["group_names_json"]))
     before_pro_groups = json.loads(str(data["before_pro_groups_json"]))
@@ -85,7 +84,6 @@ def get_cdl_tables(npz_path=DEFAULT_CDL_NPZ_PATH):
     return {
         "group_names": group_names,
         "group_to_idx": {g: i for i, g in enumerate(group_names)},
-        "cdl_grid": jnp.asarray(data["cdl_grid"], dtype=jnp.float64),
         "cdl_grid_np": np.asarray(data["cdl_grid"], dtype=np.float64),
         "cdl_stat_type": np.asarray(data["cdl_stat_type"]),
         "cis_pro_eh99": np.asarray(data["cis_pro_eh99"], dtype=np.float64),
@@ -98,7 +96,33 @@ def get_cdl_tables(npz_path=DEFAULT_CDL_NPZ_PATH):
     }
 
 
-@jax.jit
+@functools.lru_cache(maxsize=1)
+def get_cdl_tables(npz_path=None):
+    """Load the Conformation-Dependent Library (CDL) tables onto GPU."""
+    _, jnp_mod = _get_jax()
+    cpu = get_cpu_cdl_tables(npz_path)
+    return dict(cpu, cdl_grid=jnp_mod.asarray(cpu["cdl_grid_np"], dtype=jnp_mod.float64))
+
+
+def _bucket_xyz_np(xyz):
+    xyz_arr = np.asarray(xyz, dtype=np.float64)
+    n_x = len(xyz_arr)
+    if n_x == 0:
+        return np.zeros((64, 3), dtype=np.float64)
+    b_x = _next_bucket(n_x)
+    if b_x > n_x:
+        xyz_arr = np.pad(xyz_arr, ((0, b_x - n_x), (0, 0)), mode="constant")
+    return xyz_arr
+
+
+def _bucket_xyz_jax(xyz):
+    jax_mod, jnp_mod = _get_jax()
+    if isinstance(xyz, jax_mod.Array):
+        return xyz
+    return jnp_mod.asarray(_bucket_xyz_np(xyz), dtype=jnp_mod.float64)
+
+
+@lazy_jit()
 def _eval_bonds_kernel(xyz, iseqs, ideal, weight):
     """
     Evaluate bond lengths, deltas, sigmas, and Z-scores in float64 on GPU.
@@ -114,6 +138,18 @@ def _eval_bonds_kernel(xyz, iseqs, ideal, weight):
     return model_val, delta, sigma, z
 
 
+@register_gpu_op("eval_bonds")
+def _eval_bonds_op(xyz_p, iseqs_p, ideal_p, weight_p):
+    _, jnp_mod = _get_jax()
+    m, d, s, z = _eval_bonds_kernel(
+        _bucket_xyz_jax(xyz_p),
+        jnp_mod.asarray(iseqs_p, dtype=jnp_mod.int32),
+        jnp_mod.asarray(ideal_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(weight_p, dtype=jnp_mod.float64),
+    )
+    return np.asarray(m), np.asarray(d), np.asarray(s), np.asarray(z)
+
+
 def eval_bonds_jax(xyz, iseqs, ideal, weight):
     """Bucket-padded wrapper around _eval_bonds_kernel."""
     n = len(iseqs)
@@ -121,29 +157,19 @@ def eval_bonds_jax(xyz, iseqs, ideal, weight):
         empty = np.empty(0, dtype=np.float64)
         return empty, empty, empty, empty
     bucket = _next_bucket(n)
-    xyz_j = jnp.asarray(xyz, dtype=jnp.float64)
+    xyz_p = _bucket_xyz_np(xyz)
     if bucket > n:
         pad = bucket - n
         iseqs_p = np.pad(iseqs, ((0, pad), (0, 0)), mode="constant")
         ideal_p = np.pad(ideal, (0, pad), mode="constant")
         weight_p = np.pad(weight, (0, pad), mode="constant", constant_values=1.0)
-        m, d, s, z = _eval_bonds_kernel(
-            xyz_j,
-            jnp.asarray(iseqs_p, dtype=jnp.int32),
-            jnp.asarray(ideal_p, dtype=jnp.float64),
-            jnp.asarray(weight_p, dtype=jnp.float64),
-        )
-        return np.asarray(m[:n]), np.asarray(d[:n]), np.asarray(s[:n]), np.asarray(z[:n])
-    m, d, s, z = _eval_bonds_kernel(
-        xyz_j,
-        jnp.asarray(iseqs, dtype=jnp.int32),
-        jnp.asarray(ideal, dtype=jnp.float64),
-        jnp.asarray(weight, dtype=jnp.float64),
-    )
-    return np.asarray(m), np.asarray(d), np.asarray(s), np.asarray(z)
+    else:
+        iseqs_p, ideal_p, weight_p = iseqs, ideal, weight
+    m, d, s, z = call_gpu("eval_bonds", xyz_p, iseqs_p, ideal_p, weight_p)
+    return m[:n], d[:n], s[:n], z[:n]
 
 
-@jax.jit
+@lazy_jit()
 def _eval_angles_kernel(xyz, iseqs, ideal, weight):
     """
     Evaluate 3-point bond angles (in degrees), wrapped deltas, sigmas, and Z-scores
@@ -180,6 +206,18 @@ def _eval_angles_kernel(xyz, iseqs, ideal, weight):
     return angle_model, delta, sigma, z
 
 
+@register_gpu_op("eval_angles")
+def _eval_angles_op(xyz_p, iseqs_p, ideal_p, weight_p):
+    _, jnp_mod = _get_jax()
+    m, d, s, z = _eval_angles_kernel(
+        _bucket_xyz_jax(xyz_p),
+        jnp_mod.asarray(iseqs_p, dtype=jnp_mod.int32),
+        jnp_mod.asarray(ideal_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(weight_p, dtype=jnp_mod.float64),
+    )
+    return np.asarray(m), np.asarray(d), np.asarray(s), np.asarray(z)
+
+
 def eval_angles_jax(xyz, iseqs, ideal, weight):
     """Bucket-padded wrapper around _eval_angles_kernel."""
     n = len(iseqs)
@@ -187,29 +225,19 @@ def eval_angles_jax(xyz, iseqs, ideal, weight):
         empty = np.empty(0, dtype=np.float64)
         return empty, empty, empty, empty
     bucket = _next_bucket(n)
-    xyz_j = jnp.asarray(xyz, dtype=jnp.float64)
+    xyz_p = _bucket_xyz_np(xyz)
     if bucket > n:
         pad = bucket - n
         iseqs_p = np.pad(iseqs, ((0, pad), (0, 0)), mode="constant")
         ideal_p = np.pad(ideal, (0, pad), mode="constant")
         weight_p = np.pad(weight, (0, pad), mode="constant", constant_values=1.0)
-        m, d, s, z = _eval_angles_kernel(
-            xyz_j,
-            jnp.asarray(iseqs_p, dtype=jnp.int32),
-            jnp.asarray(ideal_p, dtype=jnp.float64),
-            jnp.asarray(weight_p, dtype=jnp.float64),
-        )
-        return np.asarray(m[:n]), np.asarray(d[:n]), np.asarray(s[:n]), np.asarray(z[:n])
-    m, d, s, z = _eval_angles_kernel(
-        xyz_j,
-        jnp.asarray(iseqs, dtype=jnp.int32),
-        jnp.asarray(ideal, dtype=jnp.float64),
-        jnp.asarray(weight, dtype=jnp.float64),
-    )
-    return np.asarray(m), np.asarray(d), np.asarray(s), np.asarray(z)
+    else:
+        iseqs_p, ideal_p, weight_p = iseqs, ideal, weight
+    m, d, s, z = call_gpu("eval_angles", xyz_p, iseqs_p, ideal_p, weight_p)
+    return m[:n], d[:n], s[:n], z[:n]
 
 
-@jax.jit
+@lazy_jit()
 def _eval_dihedrals_kernel(
     xyz, iseqs, ideal, weight, periodicity, slack, limit, top_out, alt_ideals
 ):
@@ -282,6 +310,25 @@ def _eval_dihedrals_kernel(
     return angle_model, delta, residual, score
 
 
+@register_gpu_op("eval_dihedrals")
+def _eval_dihedrals_op(
+    xyz_p, iseqs_p, ideal_p, weight_p, period_p, slack_p, limit_p, top_p, alt_p
+):
+    _, jnp_mod = _get_jax()
+    m, d, r, sc = _eval_dihedrals_kernel(
+        _bucket_xyz_jax(xyz_p),
+        jnp_mod.asarray(iseqs_p, dtype=jnp_mod.int32),
+        jnp_mod.asarray(ideal_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(weight_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(period_p, dtype=jnp_mod.int32),
+        jnp_mod.asarray(slack_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(limit_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(top_p, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(alt_p, dtype=jnp_mod.float64),
+    )
+    return np.asarray(m), np.asarray(d), np.asarray(r), np.asarray(sc)
+
+
 def eval_dihedrals_jax(
     xyz, iseqs, ideal, weight, periodicity, slack, limit, top_out, alt_ideals
 ):
@@ -291,7 +338,7 @@ def eval_dihedrals_jax(
         empty = np.empty(0, dtype=np.float64)
         return empty, empty, empty, empty
     bucket = _next_bucket(n)
-    xyz_j = jnp.asarray(xyz, dtype=jnp.float64)
+    xyz_p = _bucket_xyz_np(xyz)
     if bucket > n:
         pad = bucket - n
         iseqs_p = np.pad(iseqs, ((0, pad), (0, 0)), mode="constant")
@@ -302,33 +349,17 @@ def eval_dihedrals_jax(
         limit_p = np.pad(limit, (0, pad), mode="constant", constant_values=-1.0)
         top_p = np.pad(top_out, (0, pad), mode="constant")
         alt_p = np.pad(alt_ideals, ((0, pad), (0, 0)), mode="constant", constant_values=np.nan)
-        m, d, r, sc = _eval_dihedrals_kernel(
-            xyz_j,
-            jnp.asarray(iseqs_p, dtype=jnp.int32),
-            jnp.asarray(ideal_p, dtype=jnp.float64),
-            jnp.asarray(weight_p, dtype=jnp.float64),
-            jnp.asarray(period_p, dtype=jnp.int32),
-            jnp.asarray(slack_p, dtype=jnp.float64),
-            jnp.asarray(limit_p, dtype=jnp.float64),
-            jnp.asarray(top_p, dtype=jnp.bool_),
-            jnp.asarray(alt_p, dtype=jnp.float64),
-        )
-        return np.asarray(m[:n]), np.asarray(d[:n]), np.asarray(r[:n]), np.asarray(sc[:n])
-    m, d, r, sc = _eval_dihedrals_kernel(
-        xyz_j,
-        jnp.asarray(iseqs, dtype=jnp.int32),
-        jnp.asarray(ideal, dtype=jnp.float64),
-        jnp.asarray(weight, dtype=jnp.float64),
-        jnp.asarray(periodicity, dtype=jnp.int32),
-        jnp.asarray(slack, dtype=jnp.float64),
-        jnp.asarray(limit, dtype=jnp.float64),
-        jnp.asarray(top_out, dtype=jnp.bool_),
-        jnp.asarray(alt_ideals, dtype=jnp.float64),
+    else:
+        iseqs_p, ideal_p, weight_p = iseqs, ideal, weight
+        period_p, slack_p, limit_p, top_p, alt_p = periodicity, slack, limit, top_out, alt_ideals
+    m, d, r, sc = call_gpu(
+        "eval_dihedrals",
+        xyz_p, iseqs_p, ideal_p, weight_p, period_p, slack_p, limit_p, top_p, alt_p,
     )
-    return np.asarray(m), np.asarray(d), np.asarray(r), np.asarray(sc)
+    return m[:n], d[:n], r[:n], sc[:n]
 
 
-@jax.jit
+@lazy_jit()
 def _eval_chiralities_kernel(xyz, iseqs, ideal, weight, both_signs):
     """
     Evaluate 4-point chiral volumes, deltas, residuals, and sigma scores in float64 on GPU.
@@ -350,6 +381,19 @@ def _eval_chiralities_kernel(xyz, iseqs, ideal, weight, both_signs):
     return volume_model, delta, residual, score
 
 
+@register_gpu_op("eval_chiralities")
+def _eval_chiralities_op(xyz_p, iseqs_p, ideal_p, weight_p, both_p):
+    _, jnp_mod = _get_jax()
+    m, d, r, sc = _eval_chiralities_kernel(
+        _bucket_xyz_jax(xyz_p),
+        jnp_mod.asarray(iseqs_p, dtype=jnp_mod.int32),
+        jnp_mod.asarray(ideal_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(weight_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(both_p, dtype=jnp_mod.bool_),
+    )
+    return np.asarray(m), np.asarray(d), np.asarray(r), np.asarray(sc)
+
+
 def eval_chiralities_jax(xyz, iseqs, ideal, weight, both_signs):
     """Bucket-padded wrapper around _eval_chiralities_kernel."""
     n = len(iseqs)
@@ -357,29 +401,17 @@ def eval_chiralities_jax(xyz, iseqs, ideal, weight, both_signs):
         empty = np.empty(0, dtype=np.float64)
         return empty, empty, empty, empty
     bucket = _next_bucket(n)
-    xyz_j = jnp.asarray(xyz, dtype=jnp.float64)
+    xyz_p = _bucket_xyz_np(xyz)
     if bucket > n:
         pad = bucket - n
         iseqs_p = np.pad(iseqs, ((0, pad), (0, 0)), mode="constant")
         ideal_p = np.pad(ideal, (0, pad), mode="constant")
         weight_p = np.pad(weight, (0, pad), mode="constant", constant_values=1.0)
         both_p = np.pad(both_signs, (0, pad), mode="constant")
-        m, d, r, sc = _eval_chiralities_kernel(
-            xyz_j,
-            jnp.asarray(iseqs_p, dtype=jnp.int32),
-            jnp.asarray(ideal_p, dtype=jnp.float64),
-            jnp.asarray(weight_p, dtype=jnp.float64),
-            jnp.asarray(both_p, dtype=jnp.bool_),
-        )
-        return np.asarray(m[:n]), np.asarray(d[:n]), np.asarray(r[:n]), np.asarray(sc[:n])
-    m, d, r, sc = _eval_chiralities_kernel(
-        xyz_j,
-        jnp.asarray(iseqs, dtype=jnp.int32),
-        jnp.asarray(ideal, dtype=jnp.float64),
-        jnp.asarray(weight, dtype=jnp.float64),
-        jnp.asarray(both_signs, dtype=jnp.bool_),
-    )
-    return np.asarray(m), np.asarray(d), np.asarray(r), np.asarray(sc)
+    else:
+        iseqs_p, ideal_p, weight_p, both_p = iseqs, ideal, weight, both_signs
+    m, d, r, sc = call_gpu("eval_chiralities", xyz_p, iseqs_p, ideal_p, weight_p, both_p)
+    return m[:n], d[:n], r[:n], sc[:n]
 
 
 def _jacobi_3x3_normal_single(a_init):
@@ -476,7 +508,7 @@ def _jacobi_3x3_normal_single(a_init):
     return v2_final
 
 
-@jax.jit
+@lazy_jit()
 def _eval_planarities_kernel(xyz, iseqs, weights):
     """
     Evaluate multi-atom planarity restraints on GPU in float64.
@@ -513,6 +545,17 @@ def _eval_planarities_kernel(xyz, iseqs, weights):
     return rms_deltas, delta_max, residual, score
 
 
+@register_gpu_op("eval_planarities")
+def _eval_planarities_op(xyz_p, iseqs_p, weights_p):
+    _, jnp_mod = _get_jax()
+    rms, dmax, res, sc = _eval_planarities_kernel(
+        _bucket_xyz_jax(xyz_p),
+        jnp_mod.asarray(iseqs_p, dtype=jnp_mod.int32),
+        jnp_mod.asarray(weights_p, dtype=jnp_mod.float64),
+    )
+    return np.asarray(rms), np.asarray(dmax), np.asarray(res), np.asarray(sc)
+
+
 def eval_planarities_jax(xyz, iseqs, weights):
     """Bucket-padded wrapper around _eval_planarities_kernel."""
     n = len(iseqs)
@@ -523,20 +566,16 @@ def eval_planarities_jax(xyz, iseqs, weights):
     # Pad m_cols to next multiple of 8 (or 20) to avoid recompilation across plane sizes
     m_pad = max(20, ((m_cols + 7) // 8) * 8)
     bucket = _next_bucket(n)
-    xyz_j = jnp.asarray(xyz, dtype=jnp.float64)
+    xyz_p = _bucket_xyz_np(xyz)
     pad_n = bucket - n
     pad_m = m_pad - m_cols
     iseqs_p = np.pad(iseqs, ((0, pad_n), (0, pad_m)), mode="constant", constant_values=-1)
     weights_p = np.pad(weights, ((0, pad_n), (0, pad_m)), mode="constant", constant_values=0.0)
-    rms, dmax, res, sc = _eval_planarities_kernel(
-        xyz_j,
-        jnp.asarray(iseqs_p, dtype=jnp.int32),
-        jnp.asarray(weights_p, dtype=jnp.float64),
-    )
-    return np.asarray(rms[:n]), np.asarray(dmax[:n]), np.asarray(res[:n]), np.asarray(sc[:n])
+    rms, dmax, res, sc = call_gpu("eval_planarities", xyz_p, iseqs_p, weights_p)
+    return rms[:n], dmax[:n], res[:n], sc[:n]
 
 
-@functools.partial(jax.jit, static_argnums=(3,))
+@lazy_jit(static_argnums=(3,))
 def _accumulate_residue_rmsz_kernel(z_sq, keep_mask, res_idx, n_residues):
     """Accumulate per-residue count and sum(z^2) on GPU via segment_sum."""
     counts = jax.ops.segment_sum(
@@ -546,6 +585,18 @@ def _accumulate_residue_rmsz_kernel(z_sq, keep_mask, res_idx, n_residues):
         jnp.where(keep_mask, z_sq, 0.0), res_idx, num_segments=n_residues
     )
     return counts, sums
+
+
+@register_gpu_op("accum_rmsz")
+def _accum_rmsz_op(z_sq_p, keep_p, res_idx_p, n_res_bucket):
+    _, jnp_mod = _get_jax()
+    counts, sums = _accumulate_residue_rmsz_kernel(
+        jnp_mod.asarray(z_sq_p, dtype=jnp_mod.float64),
+        jnp_mod.asarray(keep_p, dtype=jnp_mod.bool_),
+        jnp_mod.asarray(res_idx_p, dtype=jnp_mod.int32),
+        int(n_res_bucket),
+    )
+    return np.asarray(counts), np.asarray(sums)
 
 
 def _round_to_ten_index(angle_deg):
@@ -561,10 +612,23 @@ def _round_to_ten_index(angle_deg):
     return (t + 180) // 10
 
 
-@jax.jit
+@lazy_jit()
 def _cdl_lookup_kernel(group_idx, phi_idx, psi_idx, cdl_grid):
     """Gather the 24 CDL target/sigma columns for each (group, phi_bin, psi_bin) on GPU."""
     return cdl_grid[group_idx, phi_idx, psi_idx]
+
+
+@register_gpu_op("cdl_lookup")
+def _cdl_lookup_op(group_indices, phi_indices, psi_indices):
+    _, jnp_mod = _get_jax()
+    tables = get_cdl_tables()
+    res = _cdl_lookup_kernel(
+        jnp_mod.asarray(group_indices, dtype=jnp_mod.int32),
+        jnp_mod.asarray(phi_indices, dtype=jnp_mod.int32),
+        jnp_mod.asarray(psi_indices, dtype=jnp_mod.int32),
+        tables["cdl_grid"],
+    )
+    return np.asarray(res, dtype=np.float64)
 
 
 def _get_res_type_group(resname1, resname2, tables):
@@ -599,7 +663,7 @@ def apply_cdl_updates(
     and angle restraint arrays using GPU dihedral evaluation and CDL table lookup.
     Matches mmtbx.conformation_dependent_library.update_restraints(..., cis_pro_eh99=True).
     """
-    tables = get_cdl_tables()
+    tables = get_cpu_cdl_tables()
     bond_ideal = np.array(bond_ideal, dtype=np.float64, copy=True)
     bond_weight = np.array(bond_weight, dtype=np.float64, copy=True)
     angle_ideal = np.array(angle_ideal, dtype=np.float64, copy=True)
@@ -695,20 +759,29 @@ def apply_cdl_updates(
         ],
         axis=0,
     )
-    all_angles = np.asarray(
-        dihedral_angles_jax(
-            all_quads[:, 0], all_quads[:, 1], all_quads[:, 2], all_quads[:, 3]
-        )
-    )
+    n_q = len(all_quads)
+    b_q = _next_bucket(n_q)
+    if b_q > n_q:
+        all_quads_p = np.pad(all_quads, ((0, b_q - n_q), (0, 0), (0, 0)), mode="edge")
+    else:
+        all_quads_p = all_quads
+    all_angles = call_gpu(
+        "dihedral_angles",
+        all_quads_p[:, 0],
+        all_quads_p[:, 1],
+        all_quads_p[:, 2],
+        all_quads_p[:, 3],
+    )[:n_q]
     n_t = len(threes_list)
     phis = all_angles[:n_t]
     psis = all_angles[n_t : 2 * n_t]
     omegas = all_angles[2 * n_t :]
 
     # Batch lookup CDL grid on GPU
-    group_indices = np.zeros(n_t, dtype=np.int32)
-    phi_indices = np.zeros(n_t, dtype=np.int32)
-    psi_indices = np.zeros(n_t, dtype=np.int32)
+    b_t = _next_bucket(n_t)
+    group_indices = np.zeros(b_t, dtype=np.int32)
+    phi_indices = np.zeros(b_t, dtype=np.int32)
+    psi_indices = np.zeros(b_t, dtype=np.int32)
     valid_group = np.zeros(n_t, dtype=bool)
 
     for idx, (r0, r1, r2) in enumerate(threes_list):
@@ -719,14 +792,7 @@ def apply_cdl_updates(
             phi_indices[idx] = _round_to_ten_index(phis[idx])
             psi_indices[idx] = _round_to_ten_index(psis[idx])
 
-    cdl_batch = np.asarray(
-        _cdl_lookup_kernel(
-            jnp.asarray(group_indices, dtype=jnp.int32),
-            jnp.asarray(phi_indices, dtype=jnp.int32),
-            jnp.asarray(psi_indices, dtype=jnp.int32),
-            tables["cdl_grid"],
-        )
-    )
+    cdl_batch = call_gpu("cdl_lookup", group_indices, phi_indices, psi_indices)[:n_t]
 
     # Replicate RestraintsRegistry and apply_updates
     registry_sum = {}
@@ -1062,9 +1128,10 @@ def score_from_restraints(definition, data, owned):
             idx_to_res_key.append(rk)
         atom_res_idx[i] = r_idx
 
+    xyz_p = _bucket_xyz_np(xyz)
     # Evaluate bonds and angles on GPU via JAX
-    b_model, b_delta, b_sigma, b_z = eval_bonds_jax(xyz, bond_iseqs, bond_ideal, bond_weight)
-    a_model, a_delta, a_sigma, a_z = eval_angles_jax(xyz, angle_iseqs, angle_ideal, angle_weight)
+    b_model, b_delta, b_sigma, b_z = eval_bonds_jax(xyz_p, bond_iseqs, bond_ideal, bond_weight)
+    a_model, a_delta, a_sigma, a_z = eval_angles_jax(xyz_p, angle_iseqs, angle_ideal, angle_weight)
 
     b_noh = ~is_h[bond_iseqs].any(axis=1) if len(bond_iseqs) else np.empty(0, dtype=bool)
     a_noh = ~is_h[angle_iseqs].any(axis=1) if len(angle_iseqs) else np.empty(0, dtype=bool)
@@ -1076,26 +1143,27 @@ def score_from_restraints(definition, data, owned):
         a_keep = a_noh & np.isin(angle_origin_id, V34_SCOREABLE_ORIGIN_IDS) & a_owned
 
         n_res = max(len(idx_to_res_key), 1)
+        b_res_bucket = _next_bucket(n_res)
         if len(bond_iseqs):
-            b_counts, b_z2 = _accumulate_residue_rmsz_kernel(
-                jnp.asarray(b_z * b_z, dtype=jnp.float64),
-                jnp.asarray(b_keep, dtype=jnp.bool_),
-                jnp.asarray(atom_res_idx[bond_iseqs[:, 0]], dtype=jnp.int32),
-                n_res,
-            )
-            b_counts, b_z2 = np.asarray(b_counts), np.asarray(b_z2)
+            nb = len(bond_iseqs)
+            bb = _next_bucket(nb)
+            bz2_p = np.pad(b_z * b_z, (0, bb - nb), mode="constant")
+            bkeep_p = np.pad(b_keep, (0, bb - nb), mode="constant")
+            bres_p = np.pad(atom_res_idx[bond_iseqs[:, 0]], (0, bb - nb), mode="constant")
+            b_counts, b_z2 = call_gpu("accum_rmsz", bz2_p, bkeep_p, bres_p, b_res_bucket)
+            b_counts, b_z2 = b_counts[:n_res], b_z2[:n_res]
         else:
             b_counts = np.zeros(n_res, dtype=np.int32)
             b_z2 = np.zeros(n_res, dtype=np.float64)
 
         if len(angle_iseqs):
-            a_counts, a_z2 = _accumulate_residue_rmsz_kernel(
-                jnp.asarray(a_z * a_z, dtype=jnp.float64),
-                jnp.asarray(a_keep, dtype=jnp.bool_),
-                jnp.asarray(atom_res_idx[angle_iseqs[:, 0]], dtype=jnp.int32),
-                n_res,
-            )
-            a_counts, a_z2 = np.asarray(a_counts), np.asarray(a_z2)
+            na = len(angle_iseqs)
+            ba = _next_bucket(na)
+            az2_p = np.pad(a_z * a_z, (0, ba - na), mode="constant")
+            akeep_p = np.pad(a_keep, (0, ba - na), mode="constant")
+            ares_p = np.pad(atom_res_idx[angle_iseqs[:, 0]], (0, ba - na), mode="constant")
+            a_counts, a_z2 = call_gpu("accum_rmsz", az2_p, akeep_p, ares_p, b_res_bucket)
+            a_counts, a_z2 = a_counts[:n_res], a_z2[:n_res]
         else:
             a_counts = np.zeros(n_res, dtype=np.int32)
             a_z2 = np.zeros(n_res, dtype=np.float64)
@@ -1202,7 +1270,7 @@ def score_from_restraints(definition, data, owned):
         d_total_mask = d_noh & d_owned
 
         d_model, _, _, d_score = eval_dihedrals_jax(
-            xyz, d_iseqs, d_ideal, d_weight, d_period, d_slack, d_limit, d_top_out, d_alt
+            xyz_p, d_iseqs, d_ideal, d_weight, d_period, d_slack, d_limit, d_top_out, d_alt
         )
         d_out_mask = d_total_mask & (d_origin == V33_OUTLIER_ORIGIN_ID) & (d_score > V33_CUTOFF)
         d_out_idx = np.flatnonzero(d_out_mask)
@@ -1236,7 +1304,7 @@ def score_from_restraints(definition, data, owned):
         c_owned = atom_owned[c_iseqs[:, 0]]
         c_total_mask = c_noh & c_owned
 
-        c_model, _, _, c_score = eval_chiralities_jax(xyz, c_iseqs, c_ideal, c_weight, c_both)
+        c_model, _, _, c_score = eval_chiralities_jax(xyz_p, c_iseqs, c_ideal, c_weight, c_both)
         c_out_mask = c_total_mask & (c_origin == V33_OUTLIER_ORIGIN_ID) & (c_score > V33_CUTOFF)
         c_out_idx = np.flatnonzero(c_out_mask)
         if c_out_idx.size:
@@ -1287,7 +1355,7 @@ def score_from_restraints(definition, data, owned):
         if len(p_iseqs):
             p_owned = atom_owned[p_iseqs[:, 0]]
             p_total = int(p_owned.sum())
-            p_rms, p_dmax, _, p_score = eval_planarities_jax(xyz, p_iseqs, p_weights)
+            p_rms, p_dmax, _, p_score = eval_planarities_jax(xyz_p, p_iseqs, p_weights)
             p_out_mask = p_owned & (p_score > V33_CUTOFF)
             p_out_idx = np.flatnonzero(p_out_mask)
             if p_out_idx.size:

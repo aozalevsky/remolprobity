@@ -165,7 +165,8 @@ class JaxAtomGroup:
         return len(self._atoms)
 
     def append_atom(self, atom):
-        atom._parent = self
+        if isinstance(atom, JaxAtom):
+            atom._parent = self
         self._atoms.append(atom)
 
     def remove_atom(self, atom):

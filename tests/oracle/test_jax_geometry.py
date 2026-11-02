@@ -1,5 +1,5 @@
 """
-Unit and oracle-parity tests for GPU covalent bond & angle geometry validation
+Oracle-parity tests for GPU covalent bond & angle geometry validation
 (remolprobity.jax_geometry: v34 CDL + v33).
 """
 import glob
@@ -9,7 +9,11 @@ import pickle
 import numpy as np
 import pytest
 
+pytest.importorskip("jax")
+
 from remolprobity import compare, io, jax_geometry, jax_io, result
+
+pytestmark = pytest.mark.oracle
 
 CORPUS_DIR = os.environ.get(
     "REMOLPROBITY_CORPUS", os.path.expanduser("~/.cache/remolprobity/corpus")

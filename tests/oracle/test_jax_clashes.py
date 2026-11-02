@@ -1,5 +1,5 @@
 """
-Unit and oracle-parity tests for GPU all-atom clash detection (probe)
+Oracle-parity tests for GPU all-atom clash detection (probe)
 (remolprobity.jax_clashes).
 """
 import glob
@@ -10,8 +10,12 @@ import numpy as np
 import pytest
 from scipy.spatial import cKDTree
 
-from remolprobity import compare, io, jax_clashes, result
+pytest.importorskip("jax")
+
+from remolprobity import compare, io, jax_clashes
 from remolprobity.clashes import MarginError
+
+pytestmark = pytest.mark.oracle
 
 CORPUS_DIR = os.environ.get(
     "REMOLPROBITY_CORPUS", os.path.expanduser("~/.cache/remolprobity/corpus")

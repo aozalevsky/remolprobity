@@ -14,6 +14,7 @@
 #
 # Run (see %help):
 #   apptainer run remolprobity.sif MODEL -o RESULT.json [options]
+#   apptainer run --nv remolprobity.sif MODEL -o RESULT.json --gpu [options]
 #   apptainer run remolprobity.sif stock MODEL -o REFERENCE.json
 #   apptainer run remolprobity.sif compare REFERENCE.json RESULT.json
 Bootstrap: localimage
@@ -24,6 +25,7 @@ From: {{ BASE }}
     patches/probe-hisNHcheck-quadratic.patch /opt/remolprobity-patches/probe-hisNHcheck-quadratic.patch
     scripts/build_reduce.sh /opt/remolprobity-patches/build_reduce.sh
     scripts/build_probe.sh /opt/remolprobity-patches/build_probe.sh
+    scripts/build_jax_tables.py /opt/remolprobity-patches/build_jax_tables.py
     remolprobity /opt/remolprobity/remolprobity
 
 %post
@@ -45,6 +47,9 @@ From: {{ BASE }}
     apply $M/modules/probe $P/probe-hisNHcheck-quadratic.patch
     sh $P/build_reduce.sh $M/modules/reduce $M/build/reduce/exe/reduce
     sh $P/build_probe.sh $M/modules/probe $M/build/probe/exe/probe
+    $M/conda_base/bin/python -m pip install --no-cache-dir "jax[cuda12]" gemmi
+    PYTHONPATH=/opt/remolprobity $M/build/bin/mmtbx.python $P/build_jax_tables.py \
+        --molprobity-root "$M" --output-dir /opt/remolprobity/tables
     find /opt/remolprobity -name __pycache__ -prune -exec rm -rf {} +
 
 %runscript
@@ -54,6 +59,7 @@ From: {{ BASE }}
     remolprobity: MolProbity validation of very large models in spatial blocks.
 
     apptainer run remolprobity.sif MODEL -o RESULT [options]
+    apptainer run --nv remolprobity.sif MODEL -o RESULT --gpu [options]
         Validate MODEL (mmCIF or PDB). RESULT: .json, or - for stdout, gives
         JSON; any other name a pickle. --help lists the options.
     apptainer run remolprobity.sif stock MODEL -o RESULT
@@ -65,6 +71,8 @@ From: {{ BASE }}
 
 %environment
     export PATH=/opt/molprobity/build/bin:${PATH}
+    export REMOLPROBITY_TABLES_DIR=${REMOLPROBITY_TABLES_DIR:-/opt/remolprobity/tables}
+    export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
     # a PYTHONPATH given at run time (--env PYTHONPATH=...) replaces this one,
     # so the checkout it gives is the one imported; add /opt/remolprobity to
     # it to keep this copy as well

@@ -11,9 +11,6 @@ import math
 import os
 from dataclasses import dataclass
 
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -29,13 +26,18 @@ from .clashes import (
     spare_chain_ids,
 )
 from .ids import residue_id
+from .jax_tables import (
+    _get_jax,
+    build_probe_npz,
+    call_gpu,
+    default_probe_path,
+    lazy_jit,
+    register_gpu_op,
+)
 from .naming import pdb_copy
 from .tools import add_hydrogens
 
-DEFAULT_PROBE_NPZ_PATH = os.environ.get(
-    "REMOLPROBITY_PROBE_TABLES",
-    os.path.expanduser("~/.cache/remolprobity/jax_probe.npz"),
-)
+DEFAULT_PROBE_NPZ_PATH = default_probe_path()
 
 PROBE_RAD = np.float32(0.25)
 COVRADFUDGE = np.float32(0.2)
@@ -104,9 +106,11 @@ def _v3scale_array(vecs, newlen):
 
 
 @functools.lru_cache(maxsize=1)
-def load_probe_tables(npz_path=None):
-    """Load static probe tables and precomputed dot spheres."""
-    path = npz_path or DEFAULT_PROBE_NPZ_PATH
+def load_cpu_probe_tables(npz_path=None):
+    """Load static probe tables and precomputed dot spheres as NumPy arrays (no JAX import)."""
+    path = npz_path or default_probe_path()
+    if not os.path.isfile(path):
+        build_probe_npz(path, only_if_missing=True)
     npz = np.load(path, allow_pickle=False)
     meta = json.loads(str(npz["meta_json"]))
     atom_id = meta["atom_id_map"]
@@ -172,7 +176,7 @@ def load_probe_tables(npz_path=None):
     exp_vecs_list.append(e_co)
     dot_counts[num_types] = len(d_co)
 
-    # Build padded device arrays for 3 dot-count tiers:
+    # Build padded arrays for 3 dot-count tiers:
     # Tier 0: D <= 320 (all H atoms, metals, ions)
     # Tier 1: D <= 656 (C, N, O, S, P, Se, Cl, Br)
     # Tier 2: D <= 1216 (I, Xe, Rn, etc.)
@@ -187,7 +191,7 @@ def load_probe_tables(npz_path=None):
                 dv[i, :n] = dot_vecs_list[i][:n]
                 ev[i, :n] = exp_vecs_list[i][:n]
                 dm[i, :n] = True
-        tiers[max_d] = (jnp.asarray(dv), jnp.asarray(ev), jnp.asarray(dm))
+        tiers[max_d] = (dv, ev, dm)
 
     return {
         "meta": meta,
@@ -208,6 +212,19 @@ def load_probe_tables(npz_path=None):
         "all_heavy_bits": all_heavy_bits,
         "bondedto_str_to_bits": bondedto_str_to_bits,
     }
+
+
+@functools.lru_cache(maxsize=1)
+def load_probe_tables(npz_path=None):
+    """Load static probe tables with device arrays for the 3 dot-count tiers."""
+    _, jnp = _get_jax()
+    cpu_tbl = load_cpu_probe_tables(npz_path)
+    out = dict(cpu_tbl)
+    out["tiers"] = {
+        max_d: (jnp.asarray(dv), jnp.asarray(ev), jnp.asarray(dm))
+        for max_d, (dv, ev, dm) in cpu_tbl["tiers"].items()
+    }
+    return out
 
 
 def hy36decode4(s):
@@ -241,7 +258,7 @@ def load_probe_atoms(pdb_path, ogt=10):
     Load atoms from a PDB file and run probe's exact property assignment,
     chain-end/histidine charge checks, selection flags, and updateHydrogenInfo.
     """
-    tbl = load_probe_tables()
+    tbl = load_cpu_probe_tables()
     atom_id = tbl["atom_id"]
     props_map = tbl["props_map"]
     res_macros = tbl["res_macros"]
@@ -1178,7 +1195,7 @@ def load_probe_atoms(pdb_path, ogt=10):
     return new_atoms
 
 
-@functools.partial(jax.jit, static_argnames=("ignore_atom", "atom_hod", "donor_prop", "acceptor_prop", "pos_prop", "neg_prop", "water_prop"))
+@lazy_jit(static_argnames=("ignore_atom", "atom_hod", "donor_prop", "acceptor_prop", "pos_prop", "neg_prop", "water_prop"))
 def _examine_dots_batch_kernel(
     src_xyz,          # (B, 3) float64
     src_rad,          # (B,) float32
@@ -1222,6 +1239,7 @@ def _examine_dots_batch_kernel(
       2. Dot-sphere surface intersection (`examineDots`) on `(B, D, K)`.
       3. Per-`(src, neighbor_k)` condensation of `hb` flag and minimum `bo` clash gap (`<= -0.4`).
     """
+    _, jnp = _get_jax()
     B, K = nb_valid.shape
 
     # --- 1. 4-bond covalent BFS (markBonds + fixupLongBondChains) ---
@@ -1356,6 +1374,138 @@ def _examine_dots_batch_kernel(
     return pair_has_hb, pair_min_bo_gap
 
 
+@register_gpu_op("probe_dots")
+def _gpu_probe_dots(
+    xyz,
+    rad,
+    cov,
+    elem,
+    is_h,
+    res_id,
+    props,
+    flags,
+    occ,
+    alt_blank,
+    h_allow,
+    hv_bit,
+    dot_idx,
+    unique_src,
+    starts,
+    counts,
+    dir_nb,
+    batch_size=2048,
+):
+    _, jnp = _get_jax()
+    tbl = load_probe_tables()
+    atom_id = tbl["atom_id"]
+    props_map = tbl["props_map"]
+    dot_counts = tbl["dot_counts"]
+
+    ignore_atom = int(atom_id["ignoreAtom"])
+    atom_hod = int(atom_id["atomHOd"])
+    donor_prop = int(props_map["DONOR_PROP"])
+    acceptor_prop = int(props_map["ACCEPTOR_PROP"])
+    pos_prop = int(props_map["POSITIVE_PROP"])
+    neg_prop = int(props_map["NEGATIVE_PROP"])
+    water_prop = int(props_map["WATER_PROP"])
+
+    raw_k_max = int(np.max(counts))
+    k_pad = max(32, 1 << (raw_k_max - 1).bit_length())
+
+    src_d_counts = dot_counts[dot_idx[unique_src]]
+    tier_limits = (320, 656, 1216)
+
+    hb_s_list, hb_t_list = [], []
+    bo_s_list, bo_t_list, bo_g_list = [], [], []
+
+    for tier_idx, max_d in enumerate(tier_limits):
+        low_d = 0 if tier_idx == 0 else tier_limits[tier_idx - 1]
+        in_tier = (src_d_counts > low_d) & (src_d_counts <= max_d)
+        if not np.any(in_tier):
+            continue
+        tier_src = unique_src[in_tier]
+        tier_starts = starts[in_tier]
+        tier_counts = counts[in_tier]
+        dot_vecs_tbl, exp_vecs_tbl, dot_mask_tbl = tbl["tiers"][max_d]
+
+        n_tier = len(tier_src)
+        for b_start in range(0, n_tier, batch_size):
+            b_end = min(b_start + batch_size, n_tier)
+            b_len = b_end - b_start
+            b_pad = min(batch_size, max(256, 1 << (b_len - 1).bit_length()))
+
+            b_src = np.zeros(b_pad, dtype=np.int32)
+            b_src[:b_len] = tier_src[b_start:b_end]
+            b_starts = tier_starts[b_start:b_end]
+            b_counts = tier_counts[b_start:b_end]
+
+            nb_mat = np.zeros((b_pad, k_pad), dtype=np.int32)
+            nb_val = np.zeros((b_pad, k_pad), dtype=bool)
+            for r_i in range(b_len):
+                c_i = b_counts[r_i]
+                s_i = b_starts[r_i]
+                nb_mat[r_i, :c_i] = dir_nb[s_i : s_i + c_i]
+                nb_val[r_i, :c_i] = True
+
+            pair_hb, pair_bo_gap = _examine_dots_batch_kernel(
+                jnp.asarray(xyz[b_src]),
+                jnp.asarray(rad[b_src]),
+                jnp.asarray(cov[b_src]),
+                jnp.asarray(elem[b_src]),
+                jnp.asarray(is_h[b_src]),
+                jnp.asarray(res_id[b_src]),
+                jnp.asarray(props[b_src]),
+                jnp.asarray(occ[b_src]),
+                jnp.asarray(alt_blank[b_src]),
+                jnp.asarray(h_allow[b_src]),
+                jnp.asarray(hv_bit[b_src]),
+                jnp.asarray(dot_idx[b_src]),
+                jnp.asarray(nb_val),
+                jnp.asarray(xyz[nb_mat]),
+                jnp.asarray(rad[nb_mat]),
+                jnp.asarray(cov[nb_mat]),
+                jnp.asarray(elem[nb_mat]),
+                jnp.asarray(is_h[nb_mat]),
+                jnp.asarray(res_id[nb_mat]),
+                jnp.asarray(props[nb_mat]),
+                jnp.asarray(flags[nb_mat]),
+                jnp.asarray(occ[nb_mat]),
+                jnp.asarray(alt_blank[nb_mat]),
+                jnp.asarray(h_allow[nb_mat]),
+                jnp.asarray(hv_bit[nb_mat]),
+                dot_vecs_tbl,
+                exp_vecs_tbl,
+                dot_mask_tbl,
+                ignore_atom=ignore_atom,
+                atom_hod=atom_hod,
+                donor_prop=donor_prop,
+                acceptor_prop=acceptor_prop,
+                pos_prop=pos_prop,
+                neg_prop=neg_prop,
+                water_prop=water_prop,
+            )
+            hb_np = np.asarray(pair_hb)
+            bo_np = np.asarray(pair_bo_gap)
+
+            hb_rows, hb_cols = np.nonzero(hb_np)
+            if len(hb_rows):
+                hb_s_list.append(b_src[hb_rows])
+                hb_t_list.append(nb_mat[hb_rows, hb_cols])
+
+            bo_rows, bo_cols = np.nonzero(bo_np <= -0.4)
+            if len(bo_rows):
+                bo_s_list.append(b_src[bo_rows])
+                bo_t_list.append(nb_mat[bo_rows, bo_cols])
+                bo_g_list.append(bo_np[bo_rows, bo_cols])
+
+    hb_s = np.concatenate(hb_s_list) if hb_s_list else np.empty(0, dtype=np.int32)
+    hb_t = np.concatenate(hb_t_list) if hb_t_list else np.empty(0, dtype=np.int32)
+    bo_s = np.concatenate(bo_s_list) if bo_s_list else np.empty(0, dtype=np.int32)
+    bo_t = np.concatenate(bo_t_list) if bo_t_list else np.empty(0, dtype=np.int32)
+    bo_g = np.concatenate(bo_g_list) if bo_g_list else np.empty(0, dtype=np.float32)
+    return hb_s, hb_t, bo_s, bo_t, bo_g
+
+
 def probe_clashes_jax(withh_pdb, occupancy_max=10.0, use_segids=False, model_id="", batch_size=2048):
     """
     Run GPU all-atom clash detection on `withh_pdb`, returning the list of `ProbeClash`
@@ -1365,24 +1515,16 @@ def probe_clashes_jax(withh_pdb, occupancy_max=10.0, use_segids=False, model_id=
     if occupancy_max < ogt:
         ogt = int(occupancy_max)
 
-    tbl = load_probe_tables()
+    tbl = load_cpu_probe_tables()
     atom_id = tbl["atom_id"]
-    props_map = tbl["props_map"]
     atno_arr = tbl["atno"]
     co_dot_idx = tbl["co_dot_idx"]
-    dot_counts = tbl["dot_counts"]
     heavy_name_to_bits = tbl["heavy_name_to_bits"]
     default_heavy_bits = tbl["default_heavy_bits"]
     all_heavy_bits = tbl["all_heavy_bits"]
     bondedto_str_to_bits = tbl["bondedto_str_to_bits"]
 
     ignore_atom = int(atom_id["ignoreAtom"])
-    atom_hod = int(atom_id["atomHOd"])
-    donor_prop = int(props_map["DONOR_PROP"])
-    acceptor_prop = int(props_map["ACCEPTOR_PROP"])
-    pos_prop = int(props_map["POSITIVE_PROP"])
-    neg_prop = int(props_map["NEGATIVE_PROP"])
-    water_prop = int(props_map["WATER_PROP"])
 
     atoms = load_probe_atoms(withh_pdb, ogt=ogt)
     n_atoms = len(atoms)
@@ -1491,110 +1633,47 @@ def probe_clashes_jax(withh_pdb, occupancy_max=10.0, use_segids=False, model_id=
     if len(unique_src) == 0:
         return []
 
-    # Bucket K_max to a static power-of-2 so JAX compiles at most 1-2 shapes
-    raw_k_max = int(np.max(counts))
-    k_pad = max(32, 1 << (raw_k_max - 1).bit_length())
-
-    # Group unique_src by dot-count tier (320 vs 656 vs 1216)
-    src_d_counts = dot_counts[dot_idx[unique_src]]
-    tier_limits = (320, 656, 1216)
+    hb_s, hb_t, bo_s, bo_t, bo_g = call_gpu(
+        "probe_dots",
+        xyz,
+        rad,
+        cov,
+        elem,
+        is_h,
+        res_id,
+        props,
+        flags,
+        occ,
+        alt_blank,
+        h_allow,
+        hv_bit,
+        dot_idx,
+        unique_src,
+        starts,
+        counts,
+        dir_nb,
+        batch_size,
+    )
 
     hbond_keys = set()
     clash_best = {}  # unordered key -> (overlap_val, src_idx, nb_idx)
 
-    for tier_idx, max_d in enumerate(tier_limits):
-        low_d = 0 if tier_idx == 0 else tier_limits[tier_idx - 1]
-        in_tier = (src_d_counts > low_d) & (src_d_counts <= max_d)
-        if not np.any(in_tier):
-            continue
-        tier_src = unique_src[in_tier]
-        tier_starts = starts[in_tier]
-        tier_counts = counts[in_tier]
-        dot_vecs_tbl, exp_vecs_tbl, dot_mask_tbl = tbl["tiers"][max_d]
+    for s_atom, t_atom in zip(hb_s, hb_t):
+        s_str = atom_strs[s_atom]
+        t_str = atom_strs[t_atom]
+        key = (s_str + t_str) if s_str < t_str else (t_str + s_str)
+        hbond_keys.add(key)
 
-        n_tier = len(tier_src)
-        for b_start in range(0, n_tier, batch_size):
-            b_end = min(b_start + batch_size, n_tier)
-            b_len = b_end - b_start
-            # Pad batch size to power-of-2 bucket for minimal JIT compilations
-            b_pad = min(batch_size, max(256, 1 << (b_len - 1).bit_length()))
-
-            b_src = np.zeros(b_pad, dtype=np.int32)
-            b_src[:b_len] = tier_src[b_start:b_end]
-            b_starts = tier_starts[b_start:b_end]
-            b_counts = tier_counts[b_start:b_end]
-
-            nb_mat = np.zeros((b_pad, k_pad), dtype=np.int32)
-            nb_val = np.zeros((b_pad, k_pad), dtype=bool)
-            for r_i in range(b_len):
-                c_i = b_counts[r_i]
-                s_i = b_starts[r_i]
-                nb_mat[r_i, :c_i] = dir_nb[s_i : s_i + c_i]
-                nb_val[r_i, :c_i] = True
-
-            pair_hb, pair_bo_gap = _examine_dots_batch_kernel(
-                jnp.asarray(xyz[b_src]),
-                jnp.asarray(rad[b_src]),
-                jnp.asarray(cov[b_src]),
-                jnp.asarray(elem[b_src]),
-                jnp.asarray(is_h[b_src]),
-                jnp.asarray(res_id[b_src]),
-                jnp.asarray(props[b_src]),
-                jnp.asarray(occ[b_src]),
-                jnp.asarray(alt_blank[b_src]),
-                jnp.asarray(h_allow[b_src]),
-                jnp.asarray(hv_bit[b_src]),
-                jnp.asarray(dot_idx[b_src]),
-                jnp.asarray(nb_val),
-                jnp.asarray(xyz[nb_mat]),
-                jnp.asarray(rad[nb_mat]),
-                jnp.asarray(cov[nb_mat]),
-                jnp.asarray(elem[nb_mat]),
-                jnp.asarray(is_h[nb_mat]),
-                jnp.asarray(res_id[nb_mat]),
-                jnp.asarray(props[nb_mat]),
-                jnp.asarray(flags[nb_mat]),
-                jnp.asarray(occ[nb_mat]),
-                jnp.asarray(alt_blank[nb_mat]),
-                jnp.asarray(h_allow[nb_mat]),
-                jnp.asarray(hv_bit[nb_mat]),
-                dot_vecs_tbl,
-                exp_vecs_tbl,
-                dot_mask_tbl,
-                ignore_atom=ignore_atom,
-                atom_hod=atom_hod,
-                donor_prop=donor_prop,
-                acceptor_prop=acceptor_prop,
-                pos_prop=pos_prop,
-                neg_prop=neg_prop,
-                water_prop=water_prop,
-            )
-            hb_np = np.asarray(pair_hb)
-            bo_np = np.asarray(pair_bo_gap)
-
-            hb_rows, hb_cols = np.nonzero(hb_np)
-            for r_i, c_i in zip(hb_rows, hb_cols):
-                s_atom = b_src[r_i]
-                t_atom = nb_mat[r_i, c_i]
-                s_str = atom_strs[s_atom]
-                t_str = atom_strs[t_atom]
-                key = (s_str + t_str) if s_str < t_str else (t_str + s_str)
-                hbond_keys.add(key)
-
-            bo_rows, bo_cols = np.nonzero(bo_np <= -0.4)
-            for r_i, c_i in zip(bo_rows, bo_cols):
-                s_atom = b_src[r_i]
-                t_atom = nb_mat[r_i, c_i]
-                raw_gap = float(bo_np[r_i, c_i])
-                # writeRaw formats node->gap as "%.3f"
-                overlap_val = float(f"{raw_gap:.3f}")
-                if overlap_val <= -0.4:
-                    s_str = atom_strs[s_atom]
-                    t_str = atom_strs[t_atom]
-                    key = (s_str + t_str) if s_str < t_str else (t_str + s_str)
-                    prev = clash_best.get(key)
-                    if prev is None or overlap_val < prev[0]:
-                        clash_best[key] = (overlap_val, s_atom, t_atom)
+    for s_atom, t_atom, raw_gap in zip(bo_s, bo_t, bo_g):
+        # writeRaw formats node->gap as "%.3f"
+        overlap_val = float(f"{float(raw_gap):.3f}")
+        if overlap_val <= -0.4:
+            s_str = atom_strs[s_atom]
+            t_str = atom_strs[t_atom]
+            key = (s_str + t_str) if s_str < t_str else (t_str + s_str)
+            prev = clash_best.get(key)
+            if prev is None or overlap_val < prev[0]:
+                clash_best[key] = (overlap_val, int(s_atom), int(t_atom))
 
     # Filter out H-bonded pairs and construct ProbeClash objects
     results = []
@@ -1622,7 +1701,7 @@ def count_probe_atoms(pdb_path, occupancy_max=10.0, owned_fn=None):
     Reproduce `probe -q -mc -het -dumpatominfo "ogt%d not water"` on `core.pdb`
     without spawning a subprocess.
     """
-    tbl = load_probe_tables()
+    tbl = load_cpu_probe_tables()
     water_list = tbl["meta"]["WaterList"]
     ogt = 10
     if occupancy_max < ogt:
@@ -1724,7 +1803,7 @@ def score_from_withh(
         use_segids=use_segids,
         model_id=model_id,
     )
-    seen, records = set(), []
+    seen, records, worst = set(), [], None
     for c in sorted(found):
         a1, a2 = c.atoms_info
         key = c.id_str()
@@ -1732,15 +1811,23 @@ def score_from_withh(
             continue
         seen.add(key)
         p1, p2 = xyz[atom_key(a1)], xyz[atom_key(a2)]
-        if core_tree is not None:
-            bad, advice, needed = too_far([p1, p2])
-            if bad:
-                raise MarginError(
-                    "the clash %s - %s reaches within %.0f Å of the margin; %s"
-                    % (named(a1), named(a2), REACH, advice),
-                    needed,
-                )
+        if core_tree is not None or margin is not None:
+            if core_tree is not None:
+                bad, advice, needed = too_far([p1, p2])
+                if bad:
+                    message = "the clash %s - %s reaches within %.0f Å of the margin; %s" % (
+                        named(a1),
+                        named(a2),
+                        REACH,
+                        advice,
+                    )
+                    if needed is None:
+                        raise MarginError(message, needed)
+                    if worst is None or needed > worst[0]:
+                        worst = (needed, message)
         records.append((named(a1), named(a2), abs(c.overlap), math.dist(p1, p2)))
+    if worst is not None:
+        raise MarginError(worst[1], worst[0])
 
     n_atoms = count_probe_atoms(
         withh_pdb,

@@ -92,33 +92,21 @@ def run_block(task):
     times = {}
     use_gpu = bool(s.get('gpu'))
     if use_gpu:
-        from . import jax_clashes, jax_geometry, jax_io, jax_residues
-        jax_noh = jax_io.prepare_noh_hierarchy(jax_io.read_hierarchy(task['path']))
-        t = time.time()
-        rama = [r for r in jax_residues.ramachandran(jax_noh) if owned(r[0], r[1])]
-        rota = [r for r in jax_residues.rotamers(jax_noh) if owned(r[0], r[1])]
-        times['ramachandran_rotamers'] = time.time() - t
-        t = time.time()
-        cbeta = [r for r in jax_residues.cbeta(jax_noh) if owned(r[0], r[1])]
-        omega = [r for r in jax_residues.omegas(jax_noh) if owned(r[0], r[1])]
-        times['cbeta_omega'] = time.time() - t
-        t = time.time()
-        cablam, cablam_classes = jax_residues.cablam(jax_noh, owned)
-        times['cablam'] = time.time() - t
-        del jax_noh
-    else:
-        t = time.time()
-        rama = [r for r in residues.ramachandran(noh) if owned(r[0], r[1])]
-        rota = [r for r in residues.rotamers(noh) if owned(r[0], r[1])]
-        times['ramachandran_rotamers'] = time.time() - t
-        t = time.time()
-        # by the residue after the peptide, whose predecessor check_neighbours keeps in the block
-        cbeta = [r for r in residues.cbeta(noh) if owned(r[0], r[1])]
-        omega = [r for r in residues.omegas(noh) if owned(r[0], r[1])]
-        times['cbeta_omega'] = time.time() - t
-        t = time.time()
-        cablam, cablam_classes = residues.cablam(noh, owned)
-        times['cablam'] = time.time() - t
+        from . import jax_clashes, jax_geometry, jax_residues, jax_tables
+        jax_tables.set_gpu_sock(s.get('gpu_sock'))
+    res_mod = jax_residues if use_gpu else residues
+    t = time.time()
+    rama = [r for r in res_mod.ramachandran(noh) if owned(r[0], r[1])]
+    rota = [r for r in res_mod.rotamers(noh) if owned(r[0], r[1])]
+    times['ramachandran_rotamers'] = time.time() - t
+    t = time.time()
+    # by the residue after the peptide, whose predecessor check_neighbours keeps in the block
+    cbeta = [r for r in res_mod.cbeta(noh) if owned(r[0], r[1])]
+    omega = [r for r in res_mod.omegas(noh) if owned(r[0], r[1])]
+    times['cbeta_omega'] = time.time() - t
+    t = time.time()
+    cablam, cablam_classes = res_mod.cablam(noh, owned)
+    times['cablam'] = time.time() - t
 
     core = [a.xyz for a in noh.atoms() if owned(*residue_key(a.fetch_labels()))]
     margin = task.get('margin', s['margin'])

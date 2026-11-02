@@ -1,16 +1,19 @@
 """
-Unit and oracle-parity tests for JAX/GPU Ramachandran and Rotamer validation
-(remolprobity.jax_tables, remolprobity.jax_io, remolprobity.jax_residues).
+Oracle-parity tests for JAX/GPU Ramachandran, Rotamer, C-beta, Omega, and CaBLAM
+validation (remolprobity.jax_tables, remolprobity.jax_io, remolprobity.jax_residues).
 """
 import glob
 import os
 import pickle
-import time
 
 import numpy as np
 import pytest
 
+pytest.importorskip("jax")
+
 from remolprobity import compare, io, jax_io, jax_residues, jax_tables, result
+
+pytestmark = pytest.mark.oracle
 
 CORPUS_DIR = os.environ.get("REMOLPROBITY_CORPUS", os.path.expanduser("~/.cache/remolprobity/corpus"))
 
@@ -42,6 +45,8 @@ def test_tables_loaded():
     assert tables["rama_tables"].shape == (6, 180, 180)
     assert len(tables["aa_list"]) in (18, 19)
     assert tables["rota_flat"].ndim == 1
+    hashes = jax_tables.table_hashes()
+    assert set(hashes.keys()) == {"cablam_sha256", "cdl_sha256", "probe_sha256", "rotarama_sha256"}
 
 
 @pytest.mark.skipif(not REF_FILES, reason="Cached stock oracle references not found")

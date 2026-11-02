@@ -12,6 +12,9 @@ authors = [{name = "Arthur Zalevsky"}]
 requires-python = ">=3.10"
 dependencies = ["numpy", "scipy"]
 
+[project.optional-dependencies]
+gpu = ["jax[cuda12]>=0.4", "gemmi"]
+
 [project.urls]
 Homepage = "https://github.com/aozalevsky/remolprobity"
 Issues = "https://github.com/aozalevsky/remolprobity/issues"
