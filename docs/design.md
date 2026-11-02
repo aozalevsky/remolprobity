@@ -63,11 +63,11 @@ proposed in cctbx/cctbx_project#1245 (see the README's Related work).
 
 | Module | Responsibility | Depends on |
 |---|---|---|
-| `io` | Stream mmCIF `atom_site` or PDB `ATOM`/`HETATM` rows; build the atom table (coordinates, residue keys, chain and residue name order) in numpy chunks; reject multi-model input; write a block file for a set of residues | stdlib, numpy (iotbx's polymer residue classes when available) |
+| `io` | Stream mmCIF `atom_site` or PDB `ATOM`/`HETATM` rows in binary mode; build the atom table (coordinates, residue keys, chain and residue name order, and per-residue byte-offset spans `model.spans`) in numpy chunks; reject multi-model input; validate block segments (`check_segments`) and materialize block text in memory by byte offset (`block_text`, or `write_blocks` fallback) | stdlib, numpy (iotbx's polymer residue classes when available) |
 | `blocks` | Residue positions (the residue's first CA atom, else the mean of its atoms, as `io` records them); k-d median splits to a target core size; margin residues by distance; ownership map | numpy, scipy |
 | `tools` | Locate reduce and probe; reduce self-check; versions | subprocess |
-| `worker` | One block: parse; Ramachandran per chain, rotamers; reduce and probe with the global PDB name table; requested geometry definitions; margin checks; owned results as plain data | cctbx |
-| `jax_tables`, `jax_io`, `jax_residues`, `jax_clashes`, `jax_geometry` | Optional `--gpu` backend: reproducible `.npz` table builders and single persistent `GPUServer` process (`jax_tables`); hierarchy helpers (`jax_io`); GPU kernels for Ramachandran, rotamers, C-beta, omega and CaBLAM (`jax_residues`), probe dot-surface clashes (`jax_clashes`), and `v34`/`v33` geometry restraints (`jax_geometry`) | numpy, scipy, cctbx, jax |
+| `worker` | One block: materialize block text from `model_slice` (or read block file); parse; Ramachandran per chain, rotamers; reduce and probe with the global PDB name table; requested geometry definitions; margin checks; owned results as plain data | cctbx |
+| `jax_tables`, `jax_io`, `jax_residues`, `jax_clashes`, `jax_geometry` | Optional `--gpu` backend (requires the layered JAX image and `--nv`): reproducible `.npz` table builders and single persistent `GPUServer` process (`jax_tables`); hierarchy helpers (`jax_io`); GPU kernels for Ramachandran, rotamers, C-beta, omega and CaBLAM (`jax_residues`), probe dot-surface clashes (`jax_clashes`), and `v34`/`v33` geometry restraints (`jax_geometry`, including direct GeoStd + CDL `v34` proxy extraction in `_extract_v34_fast` with fallback to cctbx's `mmtbx.model.manager` on blocks with altlocs, hydrogens/deuteriums, unknown or `RNAv2` monomers, unexpected atom names, or non-polymer covalent/metal links within 3.0 Å) | numpy, scipy, cctbx, jax |
 | `result` | Result schema v2; merge of block results; canonical order; totals; provenance | stdlib |
 | `run` | Plan, write blocks, schedule workers, merge, write the result; progress log; resume | the above |
 | `adapters.ihmv33`, `adapters.ihmv34` | IHMValidation caches from a result | stdlib |
@@ -97,13 +97,22 @@ to 800k atoms.
 
 ## 2. Data flow and result
 
-1. `io` streams the model once into the atom table, refusing what iotbx
-   (and so stock MolProbity) cannot read: in mmCIF, `.` or `?` in
-   coordinates, occupancy or B, or an atom_site item iotbx needs missing;
-   in PDB, coordinates, occupancy or B that are not numbers as iotbx reads
-   them.
+1. `io` streams the model once in binary mode into the atom table and
+   records per-residue byte-offset spans (`model.spans`) when rows are
+   single-line (or 2-line 80-column wrapped `_atom_site` rows), refusing
+   what iotbx (and so stock MolProbity) cannot read: in mmCIF, `.` or `?`
+   in coordinates, occupancy or B, or an atom_site item iotbx needs
+   missing; in PDB, coordinates, occupancy or B that are not numbers as
+   iotbx reads them.
 2. `blocks` plans cores and margins.
-3. `io` streams the model again, writing each block's residues to its file.
+3. When `model.spans` is available, `io.check_segments` validates every
+   block's segment boundaries in memory without writing block files to
+   disk, and workers materialize each block's atom text in memory
+   (`io.block_text`) by reading byte ranges directly from the input file
+   (so the input file must not be modified or removed during a run).
+   Gzipped inputs and other multi-line `_atom_site` layouts fall back to
+   `io.write_blocks`, streaming the model a second time to write each
+   block's file in `workdir/blocks`.
 4. Workers process blocks; each returns a block result of what it owns, or
    the margin its core needs when its own is too small (section 3).
 5. A block that asked for a larger margin is planned again with it (same
@@ -295,10 +304,15 @@ error, crash or timeout: the run stops and writes no result.
   CUDA context, static lookup tables and compiled XLA kernels across all
   blocks, while block workers run CPU preparation without importing `jax`.
 - Worker: about 0.3 GB plus 12 KB per atom of its block, core and margin
-  (restraints), plus about 0.5 KB per residue of the model for the
-  ownership and stretch maps every worker loads (0.36-0.42 KB measured on
-  9A1N subsets); reduce about 1.3 KB per atom and probe about 2.3 KB per
-  atom run as subprocesses.
+  (restraints), plus about 0.0625 KB (62.5 bytes) per residue of the model
+  for the compact NumPy ownership, stretch and byte-span arrays every
+  worker loads from `shared.pkl` (~48 bytes per residue); reduce about
+  1.3 KB per atom and probe about 2.3 KB per atom run as subprocesses.
+  With `--gpu`, `v34` bond and angle restraints are extracted directly from
+  the GeoStd monomer library and CDL tables (`_extract_v34_fast`), avoiding
+  the ~1 GB per-worker `mmtbx.model.manager` overhead unless a block falls
+  back to cctbx (altlocs, hydrogens/deuteriums, unknown or `RNAv2`
+  monomers, unexpected atom names, or non-polymer covalent/metal links).
 - `--memory GB` chooses the number of workers, not the block size
   (`--block-atoms`, default 130,000): after planning, the most workers
   whose largest planned blocks fit in it together with the main process,

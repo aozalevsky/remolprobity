@@ -130,12 +130,20 @@ To apply both patches, use one of these:
   A base that is already patched keeps its stock reduce and its patched
   sources.
 - **GPU (`--gpu`, optional).** `--gpu` requires an NVIDIA GPU passed into
-  the container with `apptainer run --nv` (or `apptainer exec --nv`),
-  `jax[cuda12]` in `mmtbx.python`, and the four `.npz` lookup archives in
+  the container with `apptainer run --nv` (or `apptainer exec --nv`), the
+  layered JAX image (`container/remolprobity.def`, with `jax[cuda12]` in
+  `mmtbx.python`), and the four `.npz` lookup archives in
   `REMOLPROBITY_TABLES_DIR` (`/opt/remolprobity/tables` in the layered
   image, or `~/.cache/remolprobity`, built on demand or ahead of time with
   `scripts/build_jax_tables.py`). If no GPU backend is active, `--gpu` stops
-  with an error rather than falling back to CPU.
+  with an error rather than falling back to CPU. With `--gpu`, `v34` bond
+  and angle restraints are built directly from the GeoStd monomer library
+  and CDL tables without constructing `mmtbx.model.manager`, falling back
+  to cctbx's `mmtbx.model.manager` (`pdb_interpretation`) on any block with
+  alternate conformations (altlocs), explicit hydrogens or deuteriums,
+  unknown or non-standard monomer definitions (including `RNAv2`
+  nucleotides such as `PSU`), unexpected atom names, or non-polymer
+  covalent or metal links within 3.0 Å.
 - **An existing Apptainer sandbox of MolProbity:** run
   `scripts/dev_image.sh SANDBOX`. It does the same steps in place, except
   that it does not copy the package.
@@ -221,9 +229,9 @@ blocks, then estimates their costs:
   CUDA context, static lookup tables and compiled XLA kernels across all
   blocks);
 - each worker: 0.3 GB plus 12 KB per atom of its block, core and margin
-  as planned, plus 0.5 KB per residue of the model. Every worker loads
-  the whole model's ownership maps; loading them measured 0.36 to
-  0.42 KB per residue.
+  as planned, plus 0.0625 KB (62.5 bytes) per residue of the model. Every
+  worker loads the whole model's ownership and stretch arrays from
+  `shared.pkl` (about 48 bytes per residue in compact NumPy arrays).
 
 It takes the most workers whose largest blocks, run together, fit within
 the budget (at least one). How many atoms a margin adds depends on how
@@ -242,6 +250,14 @@ becomes an error naming its block.
 ### Input
 
 - **One model only.** A multi-model file is refused: split it first.
+- **Unmodified during the run.** Uncompressed mmCIF and PDB files whose
+  atom rows are single-line (or 2-line 80-column wrapped `_atom_site`
+  rows) are sliced in memory by byte offset (`model.spans`, `io.block_text`)
+  in each worker without writing block files to disk. Because workers read
+  directly from the input file at those byte offsets, the input file must
+  not be modified, truncated or removed while a run is in progress.
+  Gzipped inputs and files with other multi-line `_atom_site` layouts fall
+  back to writing block files in the workdir.
 - **Refused before planning.** These are refused, with an error naming the
   atom; stock MolProbity cannot read them either:
   - in mmCIF, `.` or `?` in coordinates, occupancy or B, or a missing

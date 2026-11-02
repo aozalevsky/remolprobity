@@ -145,6 +145,10 @@ def test_glycan_link_restraints_are_not_scored(tmp_path):
 
 FAST_V34_ORACLE = """
 import json, os, sys
+try:
+    import jax
+except ImportError as e:
+    print(json.dumps({'skip': repr(e)})); sys.exit(0)
 import numpy as np
 import iotbx.pdb
 from scitbx.array_family import flex
@@ -216,5 +220,7 @@ CORPUS_DIR = os.environ.get('REMOLPROBITY_CORPUS', os.path.expanduser('~/.cache/
 @pytest.mark.container
 def test_fast_v34_proxy_arrays_match_cctbx_across_blocks():
     out = json.loads(in_image('-c', FAST_V34_ORACLE, DATA, CORPUS_DIR).stdout.strip().splitlines()[-1])
+    if 'skip' in out:
+        pytest.skip('jax not available in image: %s' % out['skip'])
     assert out['checked_blocks'] >= 10
 
