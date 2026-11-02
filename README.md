@@ -34,9 +34,9 @@ remolprobity runs the same validators in blocks:
 - **Margin checks.** The plan checks that every block holds the sequence
   neighbours of the residues it owns. As it runs, each block checks that its
   margin holds reduce's hydrogen-bond cliques and the partners of its
-  clashes. A block whose margin is too small for these runs again by itself,
-  with the margin it asks for, up to twice `--margin`. Beyond that, the run
-  stops.
+  clashes. A block whose margin is too small for these runs again with the
+  margin it asks for, the largest any of them needs, up to twice
+  `--margin`. Beyond that, the run stops.
 - **Merging.** The block results are merged in a canonical order: residues in
   file order, clashes by atom pair, outliers by atoms. So the result does not
   depend on how the model was split. Where stock's result for a residue

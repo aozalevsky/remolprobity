@@ -43,6 +43,16 @@ def test_store_and_resume(tmp_path):
     assert schedule.run_tasks(T.die, TASKS, 2, store=store) == [0, 2, 4, 6, 8]
 
 
+def test_a_task_may_carry_its_own_store(tmp_path):
+    # blocks run again at different margins share a round, each keeping its
+    # margin's store
+    tasks = [{'block': b, 'store': str(tmp_path / ('results.m%d' % (26 + b % 2)))} for b in range(4)]
+    assert schedule.run_tasks(T.double, tasks, 2) == [0, 2, 4, 6]
+    assert sorted(os.listdir(tmp_path / 'results.m26')) == ['block00000.pkl', 'block00002.pkl']
+    assert sorted(os.listdir(tmp_path / 'results.m27')) == ['block00001.pkl', 'block00003.pkl']
+    assert schedule.run_tasks(T.die, tasks, 2) == [0, 2, 4, 6]
+
+
 def test_timeout_kills_the_workers_subprocesses(tmp_path):
     pidfile = str(tmp_path / 'pid')
     with pytest.raises(schedule.BlockError, match='timed out'):

@@ -37,3 +37,15 @@ def test_a_margin_not_above_the_blocks_own_stops_the_run():
     # the check would only repeat itself
     with pytest.raises(schedule.BlockError, match='block 3 failed'):
         run.retry_margins([asks(3, 23)], {3: 23}, 20.0)
+
+
+def test_blocks_run_again_share_one_round_largest_first():
+    # a round per margin left workers idle (8WQL: 8 blocks at 7 margins ran
+    # mostly one at a time); each keeps its margin's block file and store
+    again, size = {1: 26, 4: 26, 6: 40, 7: 34}, {1: 125697, 4: 121086, 6: 182535, 7: 146029}
+    path = {b: '/w/blocks/block%05d.m%d.cif' % (b, m) for b, m in again.items()}
+    tasks = run.retry_tasks(again, size, path, '/w', '/w/shared.pkl')
+    assert [t['block'] for t in tasks] == [6, 7, 1, 4]
+    assert [(t['margin'], t['store'], t['path']) for t in tasks] == [
+        (m, '/w/results.m%d' % m, path[b]) for b, m in ((6, 40), (7, 34), (1, 26), (4, 26))]
+    assert all(t['workdir'] == '/w' and t['shared'] == '/w/shared.pkl' for t in tasks)

@@ -101,13 +101,15 @@ def check_cliques(cliques, points_of, core_tree, margin, label):
     Raise MarginError for a clique with a member within REACH of the core
     (an owned member, or one an owned atom can touch) that has any point
     beyond margin - REACH of it: reduce could orient it differently with
-    its surroundings cut off. points_of(member) lists the member's xyz;
-    label(member) names it for messages. A member without points is an
-    error: its clique could not be checked.
+    its surroundings cut off. Of several, the one that needs the largest
+    margin, so that the block runs again once. points_of(member) lists the
+    member's xyz; label(member) names it for messages. A member without
+    points is an error: its clique could not be checked.
     """
     if core_tree is None:
         return
     limit = margin - REACH
+    worst = None  # (far, clique)
     for clique in cliques:
         points = []
         for m in clique:
@@ -120,11 +122,14 @@ def check_cliques(cliques, points_of, core_tree, margin, label):
         if float(np.min(d)) > REACH:
             continue
         far = float(np.max(d))
-        if far > limit:
-            needed = math.ceil(far + REACH)
-            raise MarginError('a reduce clique near the core (%s) reaches within %.0f Å of the margin; '
-                              'use --margin %d or more'
-                              % (', '.join(label(m) for m in clique), REACH, needed), needed)
+        if far > limit and (worst is None or far > worst[0]):
+            worst = (far, clique)
+    if worst is not None:
+        far, clique = worst
+        needed = math.ceil(far + REACH)
+        raise MarginError('a reduce clique near the core (%s) reaches within %.0f Å of the margin; '
+                          'use --margin %d or more'
+                          % (', '.join(label(m) for m in clique), REACH, needed), needed)
 
 
 SPARE_IDS = [a + b for a in ' ' + string.ascii_letters + string.digits for b in string.ascii_letters + string.digits]
@@ -276,7 +281,7 @@ def block_clashes(noh, conv, owned, core_tree, margin, tools, workdir, occupancy
                                    model_id=model_id)
     probe = shlex.quote(tools.probe)
     found = pcm.process_raw_probe_output(probe_lines(pcm.probe_txt.replace(pcm.probe_command, probe), withh))
-    seen, records = set(), []
+    seen, records, worst = set(), [], None  # worst: (needed, message) of the clash needing the largest margin
     for c in sorted(found):
         a1, a2 = c.atoms_info
         key = c.id_str()
@@ -286,9 +291,15 @@ def block_clashes(noh, conv, owned, core_tree, margin, tools, workdir, occupancy
         p1, p2 = xyz[_atom_key(a1)], xyz[_atom_key(a2)]
         bad, advice, needed = too_far([p1, p2])
         if bad:
-            raise MarginError('the clash %s - %s reaches within %.0f Å of the margin; %s'
-                              % (named(a1), named(a2), REACH, advice), needed)
+            message = 'the clash %s - %s reaches within %.0f Å of the margin; %s' % (
+                named(a1), named(a2), REACH, advice)
+            if needed is None:
+                raise MarginError(message, needed)
+            if worst is None or needed > worst[0]:
+                worst = (needed, message)
         records.append((named(a1), named(a2), abs(c.overlap), math.dist(p1, p2)))
+    if worst is not None:
+        raise MarginError(worst[1], worst[0])
 
     core_pdb = os.path.join(workdir, 'core.pdb')
     with open(withh) as fi, open(core_pdb, 'w') as fo:

@@ -189,9 +189,11 @@ altloc field; 3.3 also drops clash distances and takes `v33` geometry.
   400k-atom subsets of 9A1N needed 21-23 Å at 5,000 to 130,000 atoms per
   block, and 25 Å held every layout tried.
 - A block whose margin is too small is planned again with the margin it
-  names (the same core, so the same residues owned; members at that
-  margin, sequence neighbours checked) and run again, its files and
-  results kept apart by margin. This repeats while the margin it names is
+  names, the largest that any of its cliques or clashes needs (the same
+  core, so the same residues owned; members at that margin, sequence
+  neighbours checked), and run again, its files and results kept apart by
+  margin. The blocks run again in a pass share one round, whatever their
+  margins. This repeats while the margin it names is
   larger than the one it ran at and at most twice `--margin`; beyond that
   the run fails with the block's margin error. Margins can differ between
   blocks because each block owns only its core and its own checks certify
@@ -298,8 +300,10 @@ error, crash or timeout: the run stops and writes no result.
   block, workers, expected peak) before starting. `--nproc` overrides it;
   a warning is given when the expected peak exceeds the budget. A block run again with a
   larger margin (section 3) can exceed the first round's estimate: each
-  is logged with its atoms and expected worker memory, with a warning when
-  the round's expected peak exceeds the budget. A hard limit is the caller's
+  is logged with its atoms and expected worker memory, the round runs with
+  as many workers as fit the budget (at most the first round's, at least
+  one), and a warning is given when its expected peak still exceeds the
+  budget. A hard limit is the caller's
   (the README shows `systemd-run --user --scope -p MemoryMax=...`).
 - The budget without `--memory`: the smaller of 90% of what the process's
   cgroup memory limit leaves (cgroup v2 `memory.max`, or `memory.high` if

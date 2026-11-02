@@ -197,6 +197,17 @@ def retry_margins(block_results, margin_of, base):
     return out
 
 
+def retry_tasks(again, size, path, work, shared):
+    """
+    The tasks for the blocks run again ({block: margin}), one round for
+    all of them, largest (size: atoms, core and margin) first. Each has its
+    margin's block file (path[block]) and results store, results.m<margin>.
+    """
+    return [{'block': b, 'path': path[b], 'workdir': work, 'shared': shared, 'margin': again[b],
+             'store': os.path.join(work, 'results.m%d' % again[b])}
+            for b in sorted(again, key=lambda b: (-size[b], b))]
+
+
 def _plan_key(model, params):
     h = hashlib.sha256()
     h.update(model.sha256.encode())
@@ -377,9 +388,9 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
                                        store=os.path.join(work, 'results'), log=log, preload=PRELOAD,
                                        describe=describe, known=KNOWN)
     # A block whose core needs more margin than it has (a reduce clique or a
-    # clash reaching too near its edge) runs again, alone, with what it
-    # asks for: same core, so the same residues owned, and its own checks
-    # certify it. Each margin has its own block files and results store.
+    # clash reaching too near its edge) runs again with what it asks for:
+    # same core, so the same residues owned, and its own checks certify it.
+    # Each margin has its own block files and results store.
     retried, members = {}, list(plan.members)
     atom_owner = plan.owner[model.res_of]
     residue_atoms = model.atoms_per_residue()
@@ -397,9 +408,9 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
         for b in todo:
             log('block %d needs a margin of %d Å: running it again, %d atoms, about %.1f GB'
                 % (b, again[b], size[b], worker_gb(size[b], len(model.residues))))
-        # each margin runs as a round of its own, with up to nproc workers
-        peak = max(expected_gb([size[b] for b in todo if again[b] == m], nproc, model.n_atoms, len(model.residues))
-                   for m in set(again.values()))
+        # all of them in one round, with up to nproc workers, fewer if their larger blocks need it
+        workers, peak = choose_workers(list(size.values()), model.n_atoms, len(model.residues), budget_gb,
+                                       cpus=nproc)
         if budget_gb is not None and peak > budget_gb:
             log('warning: blocks run again with larger margins may need %.1f GB, more than the memory budget of '
                 '%.1f GB' % (peak, budget_gb))
@@ -407,13 +418,10 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
         path = dict(zip(todo, io.write_blocks(model, [members[b] for b in todo], block_dir, a.zero_occupancy_as_one,
                                               names=['block%05d.m%d' % (b, again[b]) for b in todo],
                                               missing_b_as_zero=a.missing_b_as_zero)))
-        for m in sorted(set(again.values())):
-            tasks_m = [{'block': b, 'path': path[b], 'workdir': work, 'shared': shared, 'margin': m}
-                       for b in todo if again[b] == m]
-            for br in schedule.run_tasks(worker.run_block, tasks_m, min(nproc, len(tasks_m)),
-                                         timeout=a.block_timeout, store=os.path.join(work, 'results.m%d' % m),
-                                         log=log, preload=PRELOAD, describe=describe, known=KNOWN):
-                block_results[at[br['block']]] = br
+        for br in schedule.run_tasks(worker.run_block, retry_tasks(again, size, path, work, shared), workers,
+                                     timeout=a.block_timeout, log=log, preload=PRELOAD, describe=describe,
+                                     known=KNOWN):
+            block_results[at[br['block']]] = br
         retried.update(again)
     provenance = {
         'remolprobity': __version__, 'cctbx': commit, 'tools': hashes,

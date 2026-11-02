@@ -48,6 +48,15 @@ def test_margin_error_carries_the_margin_it_asks_for():
     assert '--margin %d or more' % e.value.needed in str(e.value)
 
 
+
+def test_a_block_asks_for_the_largest_margin_any_clique_needs():
+    # one retry at the largest need, not one per clique: the first clique
+    # needs 25 Å, the second 35 Å
+    with pytest.raises(MarginError) as e:
+        check_cliques([['near', 'far'], ['near', 'far2']], lambda m: POINTS[m], CORE, 15.0, lambda m: 'res ' + m)
+    assert e.value.needed == 35
+    assert 'res far2' in str(e.value) and '--margin 35 or more' in str(e.value)
+
 # reduce's USER  MOD records with residue numbers above 9999: rotatable groups
 # in hybrid-36 (A0L6 is 10762), flips (amide, His) in decimal of any width
 RECORDS = """\

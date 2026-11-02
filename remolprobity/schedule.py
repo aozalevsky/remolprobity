@@ -33,8 +33,13 @@ def _child(fn, task, conn, known=()):
         conn.close()
 
 
+def _store(store, task):
+    """The task's own results store (its 'store'), else the run's"""
+    return task.get('store', store)
+
+
 def _path(store, task):
-    return os.path.join(store, 'block%05d.pkl' % task['block'])
+    return os.path.join(_store(store, task), 'block%05d.pkl' % task['block'])
 
 
 def _save(path, value):
@@ -78,7 +83,8 @@ def run_tasks(fn, tasks, nproc, timeout=None, store=None, log=None, preload=(), 
     estimate of the time left. An exception of a type in known (a problem
     with the data, not with the code) stops the run with its message alone;
     its traceback goes to the store, as block#####.traceback.txt. Any other
-    carries its traceback in the error.
+    carries its traceback in the error. A task with a 'store' keeps its
+    result there instead of in store.
     """
     if nproc < 1:
         raise ValueError('nproc must be at least 1, not %r' % (nproc,))
@@ -90,10 +96,10 @@ def run_tasks(fn, tasks, nproc, timeout=None, store=None, log=None, preload=(), 
         ctx.set_forkserver_preload(list(preload))
     log = log or (lambda message: None)
     results, pending = {}, []
-    if store:
-        os.makedirs(store, exist_ok=True)
+    for d in {_store(store, t) for t in tasks if _store(store, t)}:
+        os.makedirs(d, exist_ok=True)
     for t in tasks:
-        if store and os.path.exists(_path(store, t)):
+        if _store(store, t) and os.path.exists(_path(store, t)):
             try:
                 with open(_path(store, t), 'rb') as f:
                     results[t['block']] = pickle.load(f)
@@ -140,14 +146,14 @@ def run_tasks(fn, tasks, nproc, timeout=None, store=None, log=None, preload=(), 
                         raise BlockError('block %d failed:\n%s' % (b, value))
                     if status == 'refused':
                         message, trace = value
-                        if store:
-                            path = os.path.join(store, 'block%05d.traceback.txt' % b)
+                        if _store(store, t):
+                            path = os.path.join(_store(store, t), 'block%05d.traceback.txt' % b)
                             with open(path, 'w') as f:
                                 f.write(trace)
                             message += ' (traceback in %s)' % path
                         raise BlockError('block %d: %s' % (b, message))
                     results[b] = value
-                    if store:
+                    if _store(store, t):
                         _save(_path(store, t), value)
                     ran += 1
                     left = (time.time() - start_all) / ran * (len(pending) + len(running))
