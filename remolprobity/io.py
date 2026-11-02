@@ -90,18 +90,48 @@ def cif_rows(path, _pos=None):
     """The atom_site loop of an mmCIF file: its tags, then its rows as token lists"""
     tags = []
     track = _pos is not None and _pos[2]
-    f_ctx = open(path, 'r', newline='') if track else _open(path)
-    with f_ctx as f:
+    if not track:
+        with _open(path) as f:
+            it = iter(f)
+            line = ''
+            for line in it:
+                if line.startswith('_atom_site.'):
+                    tags.append(line.split()[0][len('_atom_site.'):])
+                elif tags:
+                    break
+            if not tags:
+                raise InputError('%s has no atom_site loop' % path)
+            yield tags
+            n_tags = len(tags)
+            row = []
+            while line is not None:
+                if line.startswith(';'):
+                    raise InputError('%s: text fields in atom_site are not supported' % path)
+                if line.startswith(('#', 'loop_', '_', 'data_')):
+                    break
+                tokens = cif_tokens(line)
+                if not row and len(tokens) == n_tags:
+                    yield tokens
+                else:
+                    row += tokens
+                    while len(row) >= n_tags:
+                        yield row[:n_tags]
+                        row = row[n_tags:]
+                line = next(it, None)
+            if row:
+                raise InputError('%s: atom_site ends in the middle of a row' % path)
+        return
+
+    with open(path, 'rb') as f:
         it = iter(f)
-        line = ''
+        raw = b''
         offset = 0
         line_start = 0
-        for line in it:
-            if track:
-                line_start = offset
-                offset += len(line)
-            if line.startswith('_atom_site.'):
-                tags.append(line.split()[0][len('_atom_site.'):])
+        for raw in it:
+            line_start = offset
+            offset += len(raw)
+            if raw.startswith(b'_atom_site.'):
+                tags.append(raw.split()[0][len(b'_atom_site.'):].decode('ascii'))
             elif tags:
                 break
         if not tags:
@@ -109,31 +139,45 @@ def cif_rows(path, _pos=None):
         yield tags
         n_tags = len(tags)
         row = []
-        while line is not None:
+        row_start = line_start
+        while raw is not None:
+            try:
+                line = raw.decode('ascii') if track else raw.decode('utf-8')
+            except UnicodeDecodeError:
+                track = _pos[2] = False
+                line = raw.decode('utf-8')
             if line.startswith(';'):
                 raise InputError('%s: text fields in atom_site are not supported' % path)
             if line.startswith(('#', 'loop_', '_', 'data_')):
                 break
+            if track and (not line.endswith('\n') or line.endswith('\r\n')):
+                track = _pos[2] = False
             tokens = cif_tokens(line)
             if not row and len(tokens) == n_tags:
                 if track:
-                    if not line.endswith('\n') or line.endswith('\r\n') or not line.isascii():
-                        track = _pos[2] = False
-                    else:
-                        _pos[0] = line_start
-                        _pos[1] = offset
+                    _pos[0] = line_start
+                    _pos[1] = offset
                 yield tokens
             else:
-                if track:
-                    track = _pos[2] = False
+                if not row:
+                    row_start = line_start
                 row += tokens
-                while len(row) >= n_tags:
-                    yield row[:n_tags]
-                    row = row[n_tags:]
-            line = next(it, None)
-            if line is not None and track:
+                if len(row) == n_tags:
+                    if track:
+                        _pos[0] = row_start
+                        _pos[1] = offset
+                    yield row
+                    row = []
+                elif len(row) > n_tags:
+                    if track:
+                        track = _pos[2] = False
+                    while len(row) >= n_tags:
+                        yield row[:n_tags]
+                        row = row[n_tags:]
+            raw = next(it, None)
+            if raw is not None:
                 line_start = offset
-                offset += len(line)
+                offset += len(raw)
         if row:
             raise InputError('%s: atom_site ends in the middle of a row' % path)
 
@@ -413,16 +457,18 @@ def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=F
     run = -1
     prev_chain = prev_label = prev_comp = None
     ilabel = tags.index('label_asym_id') if 'label_asym_id' in tags else c['chain']
+    c_b = tags.index('B_iso_or_equiv') if 'B_iso_or_equiv' in tags else None
     c_model, c_chain, c_seq, c_ins, c_comp = c['model'], c['chain'], c['seq'], c['ins'], c['comp']
     c_atom, c_elem, c_x, c_y, c_z, c_occ, c_alt = (
         c['atom'], c['element'], c['x'], c['y'], c['z'], c['occ'], c['alt']
     )
-    span_res, span_run, span_lbl_idx, span_start, span_end = [], [], [], [], []
+    span_res, span_run, span_lbl_idx, span_start, span_end, span_fill = [], [], [], [], [], []
     lbl_map = {}
     span_k = -1
     span_r = -1
     span_lbl = None
     span_s = span_e = 0
+    span_f = False
     for r in rows:
         if c_model is not None:
             if model is None:
@@ -450,12 +496,15 @@ def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=F
                 run += 1
             prev_chain, prev_label = chain, label
         prev_comp = comp
+        occ_val = None if occ in ('.', '?') else float(occ)
         k = t.add(chain, seq, '' if ins in ('.', '?') else ins, '%3s' % comp,
                   r[c_atom], r[c_elem].upper() if c_elem is not None else '',
                   (float(r[c_x]), float(r[c_y]), float(r[c_z])),
-                  None if occ in ('.', '?') else float(occ), run, '' if alt in ('.', '?') else alt)
+                  occ_val, run, '' if alt in ('.', '?') else alt)
         if pos[2]:
             r_k = t.runs[k]
+            row_fill = ((zero_occupancy_as_one and c_occ is not None and (occ_val is None or occ_val == 0.0))
+                        or (missing_b_as_zero and c_b is not None and r[c_b] in ('.', '?')))
             if k != span_k or r_k != span_r or label != span_lbl:
                 if span_k >= 0:
                     span_res.append(span_k)
@@ -463,7 +512,11 @@ def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=F
                     span_lbl_idx.append(lbl_map.setdefault(span_lbl, len(lbl_map)))
                     span_start.append(span_s)
                     span_end.append(span_e)
-                span_k, span_r, span_lbl, span_s = k, r_k, label, pos[0]
+                    span_fill.append(span_f)
+                span_k, span_r, span_lbl, span_s, span_f = k, r_k, label, pos[0], row_fill
+            else:
+                if row_fill:
+                    span_f = True
             span_e = pos[1]
     spans = None
     if pos[2] and span_k >= 0:
@@ -472,6 +525,7 @@ def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=F
         span_lbl_idx.append(lbl_map.setdefault(span_lbl, len(lbl_map)))
         span_start.append(span_s)
         span_end.append(span_e)
+        span_fill.append(span_f)
         spans = (
             np.array(span_res, dtype=np.int32),
             np.array(span_run, dtype=np.int32),
@@ -479,6 +533,7 @@ def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=F
             np.array(span_start, dtype=np.int64),
             np.array(span_end, dtype=np.int64),
             list(lbl_map),
+            np.array(span_fill, dtype=bool),
         )
     return t.model(path, 'cif', tags, spans=spans)
 
@@ -516,20 +571,34 @@ def _pdb_records(path, _pos=None):
     """ATOM, HETATM and TER lines of a PDB file; refuses a second MODEL"""
     models = 0
     track = _pos is not None and _pos[2]
-    f_ctx = open(path, 'r', newline='') if track else _open(path)
+    if not track:
+        with _open(path) as f:
+            for line in f:
+                if line.startswith('MODEL'):
+                    models += 1
+                    if models > 1:
+                        raise InputError('%s has more than one model; split them' % path)
+                elif line.startswith(('ATOM  ', 'HETATM', 'TER')):
+                    yield line.rstrip('\n')
+        return
+
     offset = 0
-    with f_ctx as f:
-        for line in f:
-            if track:
-                line_start = offset
-                offset += len(line)
-            if line.startswith('MODEL'):
+    with open(path, 'rb') as f:
+        for raw in f:
+            line_start = offset
+            offset += len(raw)
+            if raw.startswith(b'MODEL'):
                 models += 1
                 if models > 1:
                     raise InputError('%s has more than one model; split them' % path)
-            elif line.startswith(('ATOM  ', 'HETATM', 'TER')):
+            elif raw.startswith((b'ATOM  ', b'HETATM', b'TER')):
+                try:
+                    line = raw.decode('ascii') if track else raw.decode('utf-8')
+                except UnicodeDecodeError:
+                    track = _pos[2] = False
+                    line = raw.decode('utf-8')
                 if track:
-                    if not line.endswith('\n') or line.endswith('\r\n') or not line.isascii():
+                    if not line.endswith('\n') or line.endswith('\r\n'):
                         track = _pos[2] = False
                     else:
                         _pos[0] = line_start
@@ -617,6 +686,7 @@ def _read_pdb(path, check=True):
             None,
             np.array(span_start, dtype=np.int64),
             np.array(span_end, dtype=np.int64),
+            None,
             None,
         )
     return t.model(path, 'pdb', [], spans=spans)
@@ -790,7 +860,7 @@ def check_segments(model, members, paths=None):
     ilabel = model.tags.index('label_asym_id') if has_label else None
     label_is_chain = cols['chain'] == ilabel
     if model.spans is not None:
-        span_res, span_run, span_lbl_idx, _, _, label_table = model.spans
+        span_res, span_run, span_lbl_idx, _, _, label_table, *_ = model.spans
         res_auth = [c for c, _ in model.residues]
         res_comp = [n.strip() for n in model.resnames]
         n_res = len(model.residues)
@@ -879,12 +949,14 @@ def block_text(spec, members_b, path='<block>'):
     zero_occ = spec['zero_occupancy_as_one']
     miss_b = spec['missing_b_as_zero']
     if spans is not None:
-        span_res, span_run, span_lbl_idx, span_start, span_end, label_table = spans
+        span_res, span_run, span_lbl_idx, span_start, span_end, label_table, *rest = spans
+        span_fill = rest[0] if rest else None
         auth_table, res_auth_idx = spec['auth_table'], spec['res_auth_idx']
         comp_table, res_comp_idx = spec['comp_table'], spec['res_comp_idx']
         idx = np.flatnonzero(in_b[span_res])
         if fmt == 'cif':
             tags = spec['tags']
+            n_tags = len(tags)
             head = 'data_block\nloop_\n' + ''.join('_atom_site.%s\n' % t for t in tags)
             if len(idx) == 0:
                 return head + '#\n'
@@ -901,7 +973,7 @@ def block_text(spec, members_b, path='<block>'):
             seg = _Segments(path)
             chunks = [head]
             cur_start = cur_end = -1
-            with open(spec['path'], 'r', newline='') as f:
+            with open(spec['path'], 'rb') as f:
                 for m_s, m_e in zip(run_starts, run_ends):
                     s_f = int(idx[m_s])
                     s_l = int(idx[m_e - 1])
@@ -918,24 +990,26 @@ def block_text(spec, members_b, path='<block>'):
                         s = int(idx[m])
                         st, en = int(span_start[s]), int(span_end[s])
                         lbl_s = label_table[int(span_lbl_idx[s])] if has_label else None
-                        rewrite = (zero_occ and iocc is not None) or (ib is not None) or (has_label and out != lbl_s)
+                        need_fill = bool(span_fill[s]) if span_fill is not None else ((zero_occ and iocc is not None) or (ib is not None))
+                        rewrite = need_fill or (has_label and out != lbl_s)
                         if not rewrite:
                             if cur_end == st:
                                 cur_end = en
                             else:
                                 if cur_start >= 0:
                                     f.seek(cur_start)
-                                    chunks.append(f.read(cur_end - cur_start))
+                                    chunks.append(f.read(cur_end - cur_start).decode('ascii'))
                                 cur_start, cur_end = st, en
                         else:
                             if cur_start >= 0:
                                 f.seek(cur_start)
-                                chunks.append(f.read(cur_end - cur_start))
+                                chunks.append(f.read(cur_end - cur_start).decode('ascii'))
                                 cur_start = cur_end = -1
                             f.seek(st)
-                            raw = f.read(en - st)
-                            for line in raw.splitlines():
-                                row = cif_tokens(line)
+                            raw = f.read(en - st).decode('ascii')
+                            toks = cif_tokens(raw)
+                            for k_tok in range(0, len(toks), n_tags):
+                                row = toks[k_tok:k_tok + n_tags]
                                 if zero_occ and iocc is not None and (row[iocc] in ('.', '?') or float(row[iocc]) == 0):
                                     row[iocc] = '1.00'
                                 if ib is not None and row[ib] in ('.', '?'):
@@ -945,7 +1019,7 @@ def block_text(spec, members_b, path='<block>'):
                                 chunks.append(' '.join(cif_value(t) for t in row) + '\n')
                 if cur_start >= 0:
                     f.seek(cur_start)
-                    chunks.append(f.read(cur_end - cur_start))
+                    chunks.append(f.read(cur_end - cur_start).decode('ascii'))
             chunks.append('#\n')
             return ''.join(chunks)
         else:
@@ -958,7 +1032,7 @@ def block_text(spec, members_b, path='<block>'):
             seg = _Segments(path)
             chunks = []
             cur_start = cur_end = -1
-            with open(spec['path'], 'r', newline='') as f:
+            with open(spec['path'], 'rb') as f:
                 for m_s, m_e in zip(run_starts, run_ends):
                     s_f = int(idx[m_s])
                     s_l = int(idx[m_e - 1])
@@ -968,7 +1042,7 @@ def block_text(spec, members_b, path='<block>'):
                     if seg.pdb_ter(int(span_run[s_f]), auth_f):
                         if cur_start >= 0:
                             f.seek(cur_start)
-                            chunks.append(f.read(cur_end - cur_start))
+                            chunks.append(f.read(cur_end - cur_start).decode('ascii'))
                             cur_start = cur_end = -1
                         chunks.append('TER\n')
                     seg.auth = auth_table[int(res_auth_idx[rl])]
@@ -981,22 +1055,22 @@ def block_text(spec, members_b, path='<block>'):
                             else:
                                 if cur_start >= 0:
                                     f.seek(cur_start)
-                                    chunks.append(f.read(cur_end - cur_start))
+                                    chunks.append(f.read(cur_end - cur_start).decode('ascii'))
                                 cur_start, cur_end = st, en
                         else:
                             if cur_start >= 0:
                                 f.seek(cur_start)
-                                chunks.append(f.read(cur_end - cur_start))
+                                chunks.append(f.read(cur_end - cur_start).decode('ascii'))
                                 cur_start = cur_end = -1
                             f.seek(st)
-                            raw = f.read(en - st)
+                            raw = f.read(en - st).decode('ascii')
                             for line in raw.splitlines():
                                 if not pdb_number(line.ljust(60)[54:60]):
                                     line = line.ljust(60)[:54] + '%6.2f' % 1.0 + line[60:]
                                 chunks.append(line + '\n')
                 if cur_start >= 0:
                     f.seek(cur_start)
-                    chunks.append(f.read(cur_end - cur_start))
+                    chunks.append(f.read(cur_end - cur_start).decode('ascii'))
             chunks.append('END\n')
             return ''.join(chunks)
 

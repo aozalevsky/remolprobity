@@ -118,6 +118,29 @@ def test_in_memory_block_text_matches_write_blocks(tmp_path):
         paths = io.write_blocks(m, members, str(out), zero_occupancy_as_one=True)
         io.check_segments(m, members, paths)
         ms = io.model_slice(m, zero_occupancy_as_one=True)
-        for mem, p in zip(members, paths):
-            assert io.block_text(ms, mem, path=p) == open(p).read()
+        for i, (mem, p) in enumerate(zip(members, paths)):
+            b_path = tmp_path / ('inmem_%d.%s' % (i, ext))
+            b_path.write_text(io.block_text(ms, mem, path=p))
+            m_disk, m_mem = read(p), read(str(b_path))
+            assert m_disk.residues == m_mem.residues and list(m_disk.run_of) == list(m_mem.run_of)
+            np.testing.assert_array_equal(m_disk.xyz, m_mem.xyz)
+
+
+def test_in_memory_block_text_with_utf8_header_and_wrapped_rows(tmp_path):
+    utf8_head = HEAD.replace('data_test\n', "data_test\n_struct.title 'Hämoglobin, deoxy — α₂β₂'\n")
+    src = tmp_path / 'utf8.cif'
+    src.write_text(utf8_head + ROWS, encoding='utf-8')
+    m = io.read_model(str(src), zero_occupancy_as_one=True, missing_b_as_zero=True)
+    assert m.spans is not None
+    members = [np.array([0, 2]), np.array([1])]
+    out = tmp_path / 'b_utf8'
+    out.mkdir()
+    paths = io.write_blocks(m, members, str(out), zero_occupancy_as_one=True, missing_b_as_zero=True)
+    ms = io.model_slice(m, zero_occupancy_as_one=True, missing_b_as_zero=True)
+    for i, (mem, p) in enumerate(zip(members, paths)):
+        b_path = tmp_path / ('utf8_inmem_%d.cif' % i)
+        b_path.write_text(io.block_text(ms, mem, path=p))
+        assert list(io.cif_rows(str(b_path))) == list(io.cif_rows(p))
+
+
 

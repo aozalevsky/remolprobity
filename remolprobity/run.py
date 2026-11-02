@@ -31,10 +31,8 @@ from . import blocks, io, memory, result, schedule
 
 DEFAULT_BLOCK_ATOMS = 130000
 WORKER_BASE_GB, WORKER_GB_PER_ATOM = 0.3, 12e-6
-# Every worker also loads the whole model's ownership and stretch maps
-# (shared.pkl): its anonymous memory grew by 0.36-0.42 KB per residue of the
-# model on loading them (9A1N subsets of 100k and 200k atoms)
-WORKER_GB_PER_MODEL_RESIDUE = 0.5e-6
+# Every worker loads the compact model slice arrays (shared.pkl, ~20 B per residue)
+WORKER_GB_PER_MODEL_RESIDUE = 0.0625e-6
 MAIN_BASE_GB, MAIN_GB_PER_ATOM = 0.6, 6e-8
 # When --gpu is enabled, a single persistent GPU server process holds the
 # CUDA context, compiled XLA kernels and static tables (~0.82 GB RSS)
