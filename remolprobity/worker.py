@@ -7,7 +7,7 @@ import time
 
 from . import clashes, geometry, residues
 from .ids import residue_id, residue_key
-from .io import InputError
+from .io import InputError, block_text
 
 _SHARED = {}
 
@@ -54,7 +54,23 @@ def run_block(task):
     t0 = time.time()
     s = _shared(task['shared'])
     b = task['block']
-    owner = s['owner']
+    if 'owner' in s:
+        owner = s['owner']
+        stretch = s.get('stretch')
+    else:
+        mem = task['members']
+        chain_ids = s['chain_ids']
+        c_idx = s['res_chain_idx']
+        r_ids = s['res_ids']
+        o_arr = s['owner_arr']
+        st_arr = s['stretch_arr']
+        owner = {}
+        stretch = {}
+        for r in mem:
+            ri = int(r)
+            key = (chain_ids[int(c_idx[ri])], r_ids[ri].decode('ascii'))
+            owner[key] = int(o_arr[ri])
+            stretch[key] = int(st_arr[ri])
 
     def owned(chain, resid):
         o = owner.get((chain, resid))
@@ -64,7 +80,13 @@ def run_block(task):
 
     workdir = os.path.join(task['workdir'], 'scratch', 'b%05d' % b)
     os.makedirs(workdir, exist_ok=True)
-    h = iotbx.pdb.input(file_name=task['path']).construct_hierarchy()
+    if os.path.exists(task['path']):
+        h = iotbx.pdb.input(file_name=task['path']).construct_hierarchy()
+    else:
+        from scitbx.array_family import flex
+        text = block_text(s['model_slice'], task['members'], path=task['path'])
+        h = iotbx.pdb.input(source_info=None, lines=flex.split_lines(text)).construct_hierarchy()
+        del text
     try:
         # stock MolProbity stops on these too, in pdb_interpretation; here
         # before anything is computed
@@ -114,7 +136,7 @@ def run_block(task):
     clash_mod = jax_clashes if use_gpu else clashes
     try:
         clash = clash_mod.block_clashes(noh, s['conversion'], owned, cKDTree(core) if core else None,
-                                        margin, s['tools'], workdir, s['occupancy_max'], s.get('stretch'))
+                                        margin, s['tools'], workdir, s['occupancy_max'], stretch)
     except clashes.MarginError as e:
         if e.needed is None:
             raise

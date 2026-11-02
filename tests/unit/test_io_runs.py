@@ -78,6 +78,10 @@ def test_cif_polymer_after_a_ligand_run_cannot_be_kept(tmp_path):
     # ZN, then the second A run: iotbx joins a polymer residue to a chain ending in a ligand
     with pytest.raises(io.InputError, match='chain break'):
         io.write_blocks(m, [np.array([1, 3])], str(out))
+    with pytest.raises(io.InputError, match='chain break'):
+        io.check_segments(m, [np.array([1, 3])], [str(out / 'block00000.cif')])
+    with pytest.raises(io.InputError, match='chain break'):
+        io.block_text(io.model_slice(m), np.array([1, 3]), path=str(out / 'block00000.cif'))
 
 
 def test_pdb_ter_and_chain_runs(tmp_path):

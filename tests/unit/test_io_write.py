@@ -105,3 +105,19 @@ def test_blocks_written_under_given_names(tmp_path):
     paths = io.write_blocks(m, [np.array([1]), np.array([0])], str(out), names=['block00007.m23', 'block00002.m30'])
     assert [p.rsplit('/', 1)[1] for p in paths] == ['block00007.m23.cif', 'block00002.m30.cif']
     assert read(paths[0]).residues == [('A', '2A')] and read(paths[1]).residues == [('A', '1')]
+
+
+def test_in_memory_block_text_matches_write_blocks(tmp_path):
+    for ext, content in (('cif', HEAD + ROWS), ('pdb', PDB)):
+        src = tmp_path / ('m.' + ext)
+        src.write_text(content)
+        m = read(str(src))
+        members = [np.array([0, 2]), np.array([1])]
+        out = tmp_path / ('b_' + ext)
+        out.mkdir()
+        paths = io.write_blocks(m, members, str(out), zero_occupancy_as_one=True)
+        io.check_segments(m, members, paths)
+        ms = io.model_slice(m, zero_occupancy_as_one=True)
+        for mem, p in zip(members, paths):
+            assert io.block_text(ms, mem, path=p) == open(p).read()
+

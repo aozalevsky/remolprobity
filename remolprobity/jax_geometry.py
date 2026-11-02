@@ -936,11 +936,487 @@ def apply_cdl_updates(
     return bond_ideal, bond_weight, angle_ideal, angle_weight
 
 
+_MON_LIB_CACHE = {}
+_COMP_CACHE = {}
+_NA_COMP_CACHE = {}
+_LINK_CACHE = {}
+_MOD_CACHE = {}
+_NA_ALIASES = {'O1P': 'OP1', 'O2P': 'OP2', 'O3P': 'O3T', 'OP3': 'O3T'}
+_NON_COVALENT_SOLVENT_IONS = frozenset((
+    'HOH', 'WAT', 'DOD', 'MG', 'ZN', 'NA', 'K', 'CA', 'CL', 'MN', 'FE', 'FE2',
+    'CU', 'CO', 'NI', 'CD', 'HG', 'SR', 'BA', 'CS', 'RB', 'LI', 'IOD', 'BR', 'F',
+))
+
+
+def _get_mon_lib():
+    if 'srv' not in _MON_LIB_CACHE:
+        from mmtbx.monomer_library import server
+        from mmtbx.monomer_library.pdb_interpretation import master_params
+        from mmtbx.monomer_library.rna_sugar_pucker_analysis import master_phil as rna_phil
+        _MON_LIB_CACHE['srv'] = server.server()
+        _MON_LIB_CACHE['rna_params'] = rna_phil.extract()
+        _MON_LIB_CACHE['interp_params'] = master_params.extract()
+    return _MON_LIB_CACHE['srv'], _MON_LIB_CACHE['rna_params'], _MON_LIB_CACHE['interp_params']
+
+
+def _norm_na_atom(nm):
+    s = nm.strip().replace('*', "'")
+    return _NA_ALIASES.get(s, s)
+
+
+def _get_comp_template(resname, has_oxt=False):
+    key = (resname, bool(has_oxt))
+    if key not in _COMP_CACHE:
+        srv, _, _ = _get_mon_lib()
+        comp = srv.get_comp_comp_id_direct(resname)
+        if comp is None:
+            _COMP_CACHE[key] = None
+            return None
+        if has_oxt:
+            m = _get_mod_template('COO')
+            if m is not None:
+                comp = comp.apply_mod(m)
+        valid_atoms = frozenset(a.atom_id.strip() for a in comp.atom_list)
+        bonds = []
+        for b in comp.bond_list:
+            if b.value_dist is None or b.value_dist_esd in (None, 0):
+                continue
+            bonds.append((b.atom_id_1.strip(), b.atom_id_2.strip(), float(b.value_dist), 1.0 / (float(b.value_dist_esd) ** 2)))
+        angles = []
+        for a in comp.angle_list:
+            if a.value_angle is None or a.value_angle_esd in (None, 0):
+                continue
+            angles.append((a.atom_id_1.strip(), a.atom_id_2.strip(), a.atom_id_3.strip(), float(a.value_angle), 1.0 / (float(a.value_angle_esd) ** 2)))
+        _COMP_CACHE[key] = (comp, bonds, angles, valid_atoms)
+    return _COMP_CACHE[key]
+
+
+def _get_mod_template(mod_id):
+    if mod_id not in _MOD_CACHE:
+        srv, _, _ = _get_mon_lib()
+        mod = srv.mod_mod_id_dict.get(mod_id)
+        if mod is None:
+            _MOD_CACHE[mod_id] = None
+            return None
+        _MOD_CACHE[mod_id] = mod
+    return _MOD_CACHE[mod_id]
+
+
+def _get_na_template(resname, pucker_mod, term_mod):
+    key = (resname, pucker_mod, term_mod)
+    if key not in _NA_COMP_CACHE:
+        srv, _, _ = _get_mon_lib()
+        comp = srv.get_comp_comp_id_direct(resname)
+        if comp is None:
+            _NA_COMP_CACHE[key] = None
+            return None
+        if pucker_mod is not None:
+            comp, _ = srv.get_comp_comp_id_mod(comp_comp_id=comp, mod_ids=(pucker_mod,))
+        if term_mod is not None:
+            m = _get_mod_template(term_mod)
+            if m is not None:
+                comp = comp.apply_mod(m)
+        valid_atoms = frozenset(_norm_na_atom(a.atom_id) for a in comp.atom_list)
+        bonds = []
+        for b in comp.bond_list:
+            if b.value_dist is None or b.value_dist_esd in (None, 0):
+                continue
+            bonds.append((_norm_na_atom(b.atom_id_1), _norm_na_atom(b.atom_id_2), float(b.value_dist), 1.0 / (float(b.value_dist_esd) ** 2)))
+        angles = []
+        for a in comp.angle_list:
+            if a.value_angle is None or a.value_angle_esd in (None, 0):
+                continue
+            angles.append((_norm_na_atom(a.atom_id_1), _norm_na_atom(a.atom_id_2), _norm_na_atom(a.atom_id_3), float(a.value_angle), 1.0 / (float(a.value_angle_esd) ** 2)))
+        _NA_COMP_CACHE[key] = (comp, bonds, angles, valid_atoms)
+    return _NA_COMP_CACHE[key]
+
+
+def _get_link_template(link_id, norm_na=False):
+    key = (link_id, bool(norm_na))
+    if key not in _LINK_CACHE:
+        srv, _, _ = _get_mon_lib()
+        link = srv.link_link_id_dict.get(link_id)
+        if link is None:
+            _LINK_CACHE[key] = None
+            return None
+        fn = _norm_na_atom if norm_na else str.strip
+        bonds = []
+        for b in link.bond_list:
+            if b.value_dist is None or b.value_dist_esd in (None, 0):
+                continue
+            bonds.append((int(b.atom_1_comp_id), fn(b.atom_id_1), int(b.atom_2_comp_id), fn(b.atom_id_2), float(b.value_dist), 1.0 / (float(b.value_dist_esd) ** 2)))
+        angles = []
+        for a in link.angle_list:
+            if a.value_angle is None or a.value_angle_esd in (None, 0):
+                continue
+            angles.append((int(a.atom_1_comp_id), fn(a.atom_id_1), int(a.atom_2_comp_id), fn(a.atom_id_2), int(a.atom_3_comp_id), fn(a.atom_id_3), float(a.value_angle), 1.0 / (float(a.value_angle_esd) ** 2)))
+        _LINK_CACHE[key] = (bonds, angles)
+    return _LINK_CACHE[key]
+
+
+def _dihedral_deg(p0, p1, p2, p3):
+    b0 = np.array(p0, dtype=np.float64) - np.array(p1, dtype=np.float64)
+    b1 = np.array(p2, dtype=np.float64) - np.array(p1, dtype=np.float64)
+    b2 = np.array(p3, dtype=np.float64) - np.array(p2, dtype=np.float64)
+    b1_norm = float(np.linalg.norm(b1))
+    if b1_norm == 0.0:
+        return 180.0
+    b1 /= b1_norm
+    v = b0 - np.dot(b0, b1) * b1
+    w = b2 - np.dot(b2, b1) * b1
+    x = float(np.dot(v, w))
+    y = float(np.dot(np.cross(b1, v), w))
+    return float(np.degrees(np.arctan2(y, x)))
+
+
+def _extract_v34_fast(hierarchy):
+    """
+    Fast in-memory extraction of v34 bond and angle restraints (monomer library
+    templates, peptide/RNA/DNA polymer links, disulfide bonds, and GPU CDL updates)
+    without running full mmtbx.model.manager / pdb_interpretation.
+    Returns None if the block contains altlocs, hydrogens, unknown monomers,
+    ambiguous modified nucleotides, or non-polymer covalent links, falling back
+    to _model(hierarchy, 'v34').
+    """
+    from iotbx.pdb.rna_dna_detection import residue_analysis
+    import mmtbx.geometry_restraints.torsion_restraints.utils as torsion_utils
+    from mmtbx.monomer_library.rna_sugar_pucker_analysis import evaluate as rna_evaluate
+    from scipy.spatial import cKDTree
+
+    h = hierarchy.deep_copy()
+    h.merge_atoms_at_end_to_residues()
+    h.sort_atoms_in_place()
+    h.atoms().reset_i_seq()
+    atoms = h.atoms()
+    n_atoms = atoms.size()
+    if n_atoms == 0:
+        return None
+    for a in atoms:
+        e = a.element.strip().upper()
+        if e:
+            if e in ('H', 'D'):
+                return None
+        else:
+            nm = a.name.strip().lstrip('0123456789')
+            if nm[:1] in ('H', 'D') and a.parent().resname.strip() != nm:
+                return None
+
+    srv, rna_params, interp_params = _get_mon_lib()
+    peptide_break_sq = 3.0 ** 2
+    na_break_sq = 4.0 ** 2
+
+    bonds_by_i0 = {}
+    angle_iseqs_list = []
+    angle_ideal_list = []
+    angle_weight_list = []
+    angle_origin_list = []
+    cys_sg_atoms = []
+    nonpoly_cov_xyz = []
+    nonpoly_cov_res = []
+    all_res_idx = np.full(n_atoms, -1, dtype=np.int32)
+    cur_res_id = 0
+
+    def add_bond(i0, i1, ideal, weight, origin=0):
+        if i0 == i1:
+            return
+        if i0 > i1:
+            i0, i1 = i1, i0
+        lst = bonds_by_i0.get(i0)
+        if lst is None:
+            bonds_by_i0[i0] = [(i1, ideal, weight, origin)]
+        else:
+            for idx, (prev_i1, _, _, _) in enumerate(lst):
+                if prev_i1 == i1:
+                    return
+            lst.append((i1, ideal, weight, origin))
+
+    def add_angle(i0, i1, i2, ideal, weight, origin=0):
+        if i0 == i1 or i1 == i2 or i0 == i2:
+            return
+        if i0 > i2:
+            i0, i2 = i2, i0
+        angle_iseqs_list.append((i0, i1, i2))
+        angle_ideal_list.append(ideal)
+        angle_weight_list.append(weight)
+        angle_origin_list.append(origin)
+
+    for chain in h.models()[0].chains():
+        rgs = list(chain.residue_groups())
+        n_rgs = len(rgs)
+        rg_infos = []
+        for rg in rgs:
+            ags = rg.atom_groups()
+            if len(ags) != 1 or ags[0].altloc.strip() != '':
+                return None
+            ag = ags[0]
+            resname = ag.resname.strip()
+            t_entry = _get_comp_template(resname)
+            if t_entry is None:
+                return None
+            comp, _, _, _ = t_entry
+            is_pep = comp.is_peptide()
+            if not is_pep:
+                ra1 = residue_analysis(residue_atoms=ag.atoms(), distance_tolerance=rna_params.bond_detection_distance_tolerance)
+                is_na = (ra1.problems is None) or comp.is_rna_dna()
+                if is_na and (ra1.problems is not None or comp.classification not in ('RNA', 'DNA')):
+                    return None
+            else:
+                ra1 = None
+                is_na = False
+            if is_na:
+                amap = {_norm_na_atom(a.name): a for a in ag.atoms()}
+            else:
+                amap = {a.name.strip(): a for a in ag.atoms()}
+            for a in ag.atoms():
+                all_res_idx[a.i_seq] = cur_res_id
+            if not is_pep and not is_na and resname not in _NON_COVALENT_SOLVENT_IONS:
+                for a in ag.atoms():
+                    el = a.element.strip().upper()
+                    if el in ('C', 'N', 'O', 'P', 'S', 'B', 'SE'):
+                        nonpoly_cov_xyz.append(a.xyz)
+                        nonpoly_cov_res.append(cur_res_id)
+            cur_res_id += 1
+            rg_infos.append((rg, ag, resname, comp, is_pep, is_na, ra1, amap))
+
+        na_is_2p = [False] * n_rgs
+        na_pucker_mod = [None] * n_rgs
+        for idx_rg, (rg, ag, resname, comp, is_pep, is_na, ra1, amap) in enumerate(rg_infos):
+            if is_na and ra1 is not None and ra1.is_rna:
+                next_pdb_res = rg_infos[idx_rg + 1][1] if idx_rg + 1 < n_rgs else None
+                ana = rna_evaluate(
+                    params=rna_params,
+                    residue_1_deoxy_ribo_atom_dict=ra1.deoxy_ribo_atom_dict,
+                    residue_1_c1p_outbound_atom=ra1.c1p_outbound_atom,
+                    residue_2_p_atom=next_pdb_res.get_atom('P') if next_pdb_res is not None else None,
+                )
+                is_2p = bool(ana is not None and ana.is_2p)
+                na_is_2p[idx_rg] = is_2p
+                mod_resname = torsion_utils.modernize_rna_resname(resname=ag.resname)
+                if is_2p:
+                    if mod_resname in ('  A', '  G'):
+                        na_pucker_mod[idx_rg] = 'rna2p_pur'
+                    elif mod_resname in ('  C', '  U'):
+                        na_pucker_mod[idx_rg] = 'rna2p_pyr'
+                    else:
+                        na_pucker_mod[idx_rg] = 'rna2p'
+                else:
+                    if mod_resname in ('  A', '  G'):
+                        na_pucker_mod[idx_rg] = 'rna3p_pur'
+                    elif mod_resname in ('  C', '  U'):
+                        na_pucker_mod[idx_rg] = 'rna3p_pyr'
+                    else:
+                        na_pucker_mod[idx_rg] = 'rna3p'
+
+        prev_info = None
+        for idx_rg, (rg, ag, resname, comp, is_pep, is_na, ra1, amap) in enumerate(rg_infos):
+            if is_na:
+                if 'O3T' in amap:
+                    term_mod = 'p5*END'
+                elif 'P' not in amap and 'OP1' not in amap and 'OP2' not in amap:
+                    term_mod = '5*END'
+                else:
+                    term_mod = None
+                t_entry = _get_na_template(resname, na_pucker_mod[idx_rg], term_mod)
+                if t_entry is None:
+                    return None
+                _, b_list, a_list, valid_atoms = t_entry
+            else:
+                has_oxt = is_pep and ('OXT' in amap)
+                t_entry = _get_comp_template(resname, has_oxt=has_oxt)
+                if t_entry is None:
+                    return None
+                _, b_list, a_list, valid_atoms = t_entry
+            if not (amap.keys() <= valid_atoms):
+                return None
+
+            for n1, n2, ideal, w in b_list:
+                a1, a2 = amap.get(n1), amap.get(n2)
+                if a1 is not None and a2 is not None:
+                    add_bond(a1.i_seq, a2.i_seq, ideal, w, 0)
+
+            if resname == 'CYS' and 'SG' in amap:
+                cys_sg_atoms.append((amap['SG'].i_seq, amap['CA'].i_seq if 'CA' in amap else None, amap['CB'].i_seq if 'CB' in amap else None))
+
+            # Inter-residue link angles come BEFORE the second residue's intra-residue monomer angles
+            if rg.link_to_previous and prev_info is not None:
+                prev_ag, prev_resname, prev_comp, prev_is_pep, prev_is_na, prev_amap, prev_2p = prev_info
+                if prev_is_pep and is_pep:
+                    c_atom = prev_amap.get('C')
+                    n_atom = amap.get('N')
+                    if c_atom is not None and n_atom is not None:
+                        dx = c_atom.xyz[0] - n_atom.xyz[0]
+                        dy = c_atom.xyz[1] - n_atom.xyz[1]
+                        dz = c_atom.xyz[2] - n_atom.xyz[2]
+                        if dx * dx + dy * dy + dz * dz <= 9.0:
+                            if 'CN' in amap and _get_link_template('NMTRANS', norm_na=False) is not None:
+                                link_id = 'NMTRANS'
+                            elif resname == 'PRO':
+                                link_id = 'PTRANS'
+                            else:
+                                link_id = 'TRANS'
+                            l_entry = _get_link_template(link_id, norm_na=False)
+                            if l_entry is not None:
+                                lbonds, langles = l_entry
+                                maps = (prev_amap, amap)
+                                for c1, n1, c2, n2, ideal, w in lbonds:
+                                    at1 = maps[c1 - 1].get(n1)
+                                    at2 = maps[c2 - 1].get(n2)
+                                    if at1 is not None and at2 is not None:
+                                        add_bond(at1.i_seq, at2.i_seq, ideal, w, 0)
+                                for c1, n1, c2, n2, c3, n3, ideal, w in langles:
+                                    at1 = maps[c1 - 1].get(n1)
+                                    at2 = maps[c2 - 1].get(n2)
+                                    at3 = maps[c3 - 1].get(n3)
+                                    if at1 is not None and at2 is not None and at3 is not None:
+                                        add_angle(at1.i_seq, at2.i_seq, at3.i_seq, ideal, w, 0)
+                elif prev_is_na and is_na:
+                    o3_atom = prev_amap.get("O3'")
+                    p_atom = amap.get('P')
+                    if o3_atom is not None and p_atom is not None:
+                        dx = o3_atom.xyz[0] - p_atom.xyz[0]
+                        dy = o3_atom.xyz[1] - p_atom.xyz[1]
+                        dz = o3_atom.xyz[2] - p_atom.xyz[2]
+                        if dx * dx + dy * dy + dz * dz <= 9.0:
+                            link_id = 'rna2p' if prev_2p else 'rna3p'
+                            l_entry = _get_link_template(link_id, norm_na=True)
+                            if l_entry is not None:
+                                lbonds, langles = l_entry
+                                maps = (prev_amap, amap)
+                                for c1, n1, c2, n2, ideal, w in lbonds:
+                                    at1 = maps[c1 - 1].get(n1)
+                                    at2 = maps[c2 - 1].get(n2)
+                                    if at1 is not None and at2 is not None:
+                                        add_bond(at1.i_seq, at2.i_seq, ideal, w, 0)
+                                for c1, n1, c2, n2, c3, n3, ideal, w in langles:
+                                    at1 = maps[c1 - 1].get(n1)
+                                    at2 = maps[c2 - 1].get(n2)
+                                    at3 = maps[c3 - 1].get(n3)
+                                    if at1 is not None and at2 is not None and at3 is not None:
+                                        add_angle(at1.i_seq, at2.i_seq, at3.i_seq, ideal, w, 0)
+
+            for n1, n2, n3, ideal, w in a_list:
+                a1, a2, a3 = amap.get(n1), amap.get(n2), amap.get(n3)
+                if a1 is not None and a2 is not None and a3 is not None:
+                    add_angle(a1.i_seq, a2.i_seq, a3.i_seq, ideal, w, 0)
+
+            prev_info = (ag, resname, comp, is_pep, is_na, amap, na_is_2p[idx_rg])
+
+    sites = atoms.extract_xyz()
+    xyz = np.asarray(sites.as_numpy_array(), dtype=np.float64)
+    is_h = np.zeros(n_atoms, dtype=bool)
+
+    if nonpoly_cov_xyz:
+        tree_all = cKDTree(xyz)
+        np_xyz = np.asarray(nonpoly_cov_xyz, dtype=np.float64)
+        hits = tree_all.query_ball_point(np_xyz, 1.95)
+        for q_idx, nbrs in enumerate(hits):
+            r_q = nonpoly_cov_res[q_idx]
+            for j in nbrs:
+                if all_res_idx[j] != r_q:
+                    return None
+
+    if len(cys_sg_atoms) >= 2:
+        sg_xyz = xyz[[x[0] for x in cys_sg_atoms]]
+        tree = cKDTree(sg_xyz)
+        pairs = sorted(tree.query_pairs(r=3.0))
+        if pairs:
+            used_sg = set()
+            pairs_with_d = []
+            for u, v in pairs:
+                sg1 = cys_sg_atoms[u][0]
+                sg2 = cys_sg_atoms[v][0]
+                d2 = float(np.sum((xyz[sg1] - xyz[sg2]) ** 2))
+                pairs_with_d.append((d2, u, v))
+            pairs_with_d.sort()
+            ss_w = 1.0 / (0.02 ** 2)
+            ss_ang_w = 1.0 / (2.1 ** 2)
+            for _, u, v in pairs_with_d:
+                sg1, ca1, cb1 = cys_sg_atoms[u]
+                sg2, ca2, cb2 = cys_sg_atoms[v]
+                if sg1 in used_sg or sg2 in used_sg:
+                    continue
+                used_sg.add(sg1)
+                used_sg.add(sg2)
+                i_s, j_s = (sg1, sg2) if sg1 < sg2 else (sg2, sg1)
+                ca_i, cb_i = (ca1, cb1) if sg1 < sg2 else (ca2, cb2)
+                ca_j, cb_j = (ca2, cb2) if sg1 < sg2 else (ca1, cb1)
+                add_bond(i_s, j_s, 2.031, ss_w, 1)
+                if ca_i is not None and cb_i is not None and ca_j is not None and cb_j is not None:
+                    add_angle(cb_i, i_s, j_s, 104.2, ss_ang_w, 1)
+                    add_angle(i_s, j_s, cb_j, 104.2, ss_ang_w, 1)
+
+    flat_bonds_iseqs = []
+    flat_bonds_ideal = []
+    flat_bonds_weight = []
+    flat_bonds_origin = []
+    for i0 in range(n_atoms):
+        lst = bonds_by_i0.get(i0)
+        if lst:
+            for i1, ideal, w, orig in sorted(lst):
+                flat_bonds_iseqs.append((i0, i1))
+                flat_bonds_ideal.append(ideal)
+                flat_bonds_weight.append(w)
+                flat_bonds_origin.append(orig)
+
+    if flat_bonds_iseqs:
+        bond_iseqs = np.array(flat_bonds_iseqs, dtype=np.int32)
+        bond_ideal = np.array(flat_bonds_ideal, dtype=np.float64)
+        bond_weight = np.array(flat_bonds_weight, dtype=np.float64)
+        bond_origin_id = np.array(flat_bonds_origin, dtype=np.uint8)
+    else:
+        bond_iseqs = np.empty((0, 2), dtype=np.int32)
+        bond_ideal = np.empty(0, dtype=np.float64)
+        bond_weight = np.empty(0, dtype=np.float64)
+        bond_origin_id = np.empty(0, dtype=np.uint8)
+
+    if angle_iseqs_list:
+        angle_iseqs = np.array(angle_iseqs_list, dtype=np.int32)
+        angle_ideal = np.array(angle_ideal_list, dtype=np.float64)
+        angle_weight = np.array(angle_weight_list, dtype=np.float64)
+        angle_origin_id = np.array(angle_origin_list, dtype=np.uint8)
+    else:
+        angle_iseqs = np.empty((0, 3), dtype=np.int32)
+        angle_ideal = np.empty(0, dtype=np.float64)
+        angle_weight = np.empty(0, dtype=np.float64)
+        angle_origin_id = np.empty(0, dtype=np.uint8)
+
+    bond_ideal, bond_weight, angle_ideal, angle_weight = apply_cdl_updates(
+        h,
+        bond_iseqs,
+        bond_ideal,
+        bond_weight,
+        angle_iseqs,
+        angle_ideal,
+        angle_weight,
+        angle_origin_id=angle_origin_id,
+    )
+
+    atom_tuples = [atom_tuple(a.fetch_labels()) for a in atoms]
+    return {
+        'xyz': xyz,
+        'is_h': is_h,
+        'atom_tuples': atom_tuples,
+        'bond_iseqs': bond_iseqs,
+        'bond_ideal': bond_ideal,
+        'bond_weight': bond_weight,
+        'bond_origin_id': bond_origin_id,
+        'angle_iseqs': angle_iseqs,
+        'angle_ideal': angle_ideal,
+        'angle_weight': angle_weight,
+        'angle_origin_id': angle_origin_id,
+    }
+
+
 def extract_restraints(hierarchy, definition):
     """
-    Extract flat NumPy restraint proxy arrays from an iotbx hierarchy via mmtbx.model.
+    Extract flat NumPy restraint proxy arrays from an iotbx hierarchy via mmtbx.model
+    (or via the fast monomer-library + GPU CDL path for v34 when applicable).
     Used when running with cctbx in-process or when building cached restraint archives.
     """
+    if definition == 'v34':
+        fast = _extract_v34_fast(hierarchy)
+        if fast is not None:
+            return fast
     from cctbx import geometry_restraints
     from .geometry import _model
 

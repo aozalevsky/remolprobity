@@ -63,12 +63,16 @@ def cif_tokens(line):
     return out
 
 
+_WS_RE = re.compile(r'\s')
+_CIF_RESERVED = frozenset(('loop_', 'stop_', 'global_'))
+
+
 def cif_value(tok):
     """tok written as a CIF value"""
-    if tok and not any(c.isspace() for c in tok) and tok[0] not in '\'"_#$;[]' \
-            and tok.lower() not in ('loop_', 'stop_', 'global_') \
-            and not tok.lower().startswith(('data_', 'save_')):
-        return tok
+    if tok and tok[0] not in '\'"_#$;[]' and not _WS_RE.search(tok):
+        low = tok.lower()
+        if low not in _CIF_RESERVED and not low.startswith(('data_', 'save_')):
+            return tok
     return '"%s"' % tok if '"' not in tok else "'%s'" % tok
 
 
@@ -82,13 +86,20 @@ def file_format(path):
     raise InputError('%s is empty' % path)
 
 
-def cif_rows(path):
+def cif_rows(path, _pos=None):
     """The atom_site loop of an mmCIF file: its tags, then its rows as token lists"""
     tags = []
-    with _open(path) as f:
+    track = _pos is not None and _pos[2]
+    f_ctx = open(path, 'r', newline='') if track else _open(path)
+    with f_ctx as f:
         it = iter(f)
         line = ''
+        offset = 0
+        line_start = 0
         for line in it:
+            if track:
+                line_start = offset
+                offset += len(line)
             if line.startswith('_atom_site.'):
                 tags.append(line.split()[0][len('_atom_site.'):])
             elif tags:
@@ -96,17 +107,33 @@ def cif_rows(path):
         if not tags:
             raise InputError('%s has no atom_site loop' % path)
         yield tags
+        n_tags = len(tags)
         row = []
         while line is not None:
             if line.startswith(';'):
                 raise InputError('%s: text fields in atom_site are not supported' % path)
             if line.startswith(('#', 'loop_', '_', 'data_')):
                 break
-            row += cif_tokens(line)
-            while len(row) >= len(tags):
-                yield row[:len(tags)]
-                row = row[len(tags):]
+            tokens = cif_tokens(line)
+            if not row and len(tokens) == n_tags:
+                if track:
+                    if not line.endswith('\n') or line.endswith('\r\n') or not line.isascii():
+                        track = _pos[2] = False
+                    else:
+                        _pos[0] = line_start
+                        _pos[1] = offset
+                yield tokens
+            else:
+                if track:
+                    track = _pos[2] = False
+                row += tokens
+                while len(row) >= n_tags:
+                    yield row[:n_tags]
+                    row = row[n_tags:]
             line = next(it, None)
+            if line is not None and track:
+                line_start = offset
+                offset += len(line)
         if row:
             raise InputError('%s: atom_site ends in the middle of a row' % path)
 
@@ -144,6 +171,8 @@ class Model:
     introducers: dict = None
     # {run: altloc}: the first conformer's altloc of each chain object with altlocs, without hydrogens
     conformer0: dict = None
+    # (span_res, span_start, span_end) byte spans of contiguous residue runs in path, when single-line uncompressed
+    spans: tuple = None
 
     @property
     def n_atoms(self):
@@ -156,6 +185,7 @@ class Model:
 # atom names through which cctbx links polymer residues: 0, to the next residue (peptide C, nucleic O3');
 # 1, to the one before (N, P)
 LINK_SIDE = {'C': 0, "O3'": 0, 'O3*': 0, 'N': 1, 'P': 1}
+_NAN3 = (np.nan, np.nan, np.nan)
 
 
 class _Table:
@@ -164,56 +194,90 @@ class _Table:
     def __init__(self, path=''):
         self.path = path
         self.xyz_chunks, self.res_chunks, self.xyz, self.res = [], [], [], []
-        self.index, self.residues, self.resnames, self.ca = {}, [], [], {}
+        self.index, self.residues, self.resnames = {}, [], []
+        self.ca_list, self.has_o_list = [], []
         self.chains, self.names, self.runs = {}, {}, []
         self.occupancy_max, self.zero_occupancy, self.hydrogens = 0.0, 0, 0
-        # atom groups (residue, name, altloc) read so far, and the residue and run of the last atom
-        self.groups, self.last = set(), None
-        self.links = ({}, {})  # {residue: [xyz]} of link atoms out and in
-        self.has_o = set()
+        # first altloc of each residue k, extra (k, resname, altloc) groups, and last state
+        self.first_group_alt = []
+        self.extra_groups = set()
+        self.last = None
+        self.last_group = None
+        self.last_k = None
+        self.last_polymer = False
+        self.link_out, self.link_in, self.link_more = [], [], {}
         self.polymer = {}  # resname: whether iotbx links it in a polymer
         self.first_altloc = ({}, {})  # {run: {altloc: residue}}, among all atoms and among heavy atoms
 
     def add(self, chain, resseq, icode, resname, name, element, xyz, occupancy, run=0, altloc=''):
-        key = (chain, residue_id(resseq, icode))
-        k = self.index.get(key)
-        group = (k, resname.strip(), altloc)
-        if k is None:
-            k = self.index[key] = len(self.residues)
-            self.residues.append(key)
-            self.runs.append(run)  # a residue is in the run of its first atom
-            self.resnames.append(resname.strip())
-            group = (k,) + group[1:]
-        elif group not in self.groups and self.last != (k, run):
-            # a residue seen before, again after other atoms or in another chain object:
-            # merge_atoms_at_end_to_residues, as stock runs it, puts an atom group back only into an earlier
-            # one of the same name and altloc; any other stays a residue of its own, which remolprobity,
-            # naming residues by chain and number, cannot tell apart
-            raise InputError("%s: residue %s %s appears again, in two chain objects or after other residues, as "
-                             "%s with altloc '%s', which it did not have before; iotbx keeps that as a residue of "
-                             'its own, which remolprobity cannot tell apart; give it a residue number of its own'
-                             % (self.path, chain, key[1], resname.strip(), altloc))
-        self.groups.add(group)
-        self.last = (k, run)
-        self.res.append(k)
-        self.xyz.append(xyz)
-        if name == 'CA' and k not in self.ca:
-            self.ca[k] = xyz
-        elif name == 'O':
-            self.has_o.add(k)
-        side = LINK_SIDE.get(name)
-        if side is not None:
+        cur_group = (chain, resseq, icode, resname, run, altloc)
+        if cur_group == self.last_group:
+            k = self.last_k
+            polymer = self.last_polymer
+            if altloc and element not in ('H', 'D') and run == self.runs[k]:
+                self.first_altloc[1].setdefault(run, {}).setdefault(altloc, k)
+        else:
+            key = (chain, residue_id(resseq, icode))
+            k = self.index.get(key)
+            r_strip = resname.strip()
+            if k is None:
+                k = self.index[key] = len(self.residues)
+                self.residues.append(key)
+                self.runs.append(run)  # a residue is in the run of its first atom
+                self.resnames.append(r_strip)
+                self.first_group_alt.append(altloc)
+                self.ca_list.append(None)
+                self.has_o_list.append(False)
+                self.link_out.append(_NAN3)
+                self.link_in.append(_NAN3)
+                self.chains.setdefault(chain, None)
+                self.names.setdefault(resname, None)
+            else:
+                if not (r_strip == self.resnames[k] and altloc == self.first_group_alt[k]):
+                    group = (k, r_strip, altloc)
+                    if group not in self.extra_groups and self.last != (k, run):
+                        # a residue seen before, again after other atoms or in another chain object:
+                        # merge_atoms_at_end_to_residues, as stock runs it, puts an atom group back only into an earlier
+                        # one of the same name and altloc; any other stays a residue of its own, which remolprobity,
+                        # naming residues by chain and number, cannot tell apart
+                        raise InputError("%s: residue %s %s appears again, in two chain objects or after other residues, as "
+                                         "%s with altloc '%s', which it did not have before; iotbx keeps that as a residue of "
+                                         'its own, which remolprobity cannot tell apart; give it a residue number of its own'
+                                         % (self.path, chain, key[1], r_strip, altloc))
+                    self.extra_groups.add(group)
+                self.names.setdefault(resname, None)
+            self.last = (k, run)
+            self.last_group = cur_group
+            self.last_k = k
             polymer = self.polymer.get(resname)
             if polymer is None:
                 polymer = self.polymer[resname] = is_polymer_residue(resname)
-            if polymer:
-                self.links[side].setdefault(k, []).append(xyz)
-        if altloc and run == self.runs[k]:
-            self.first_altloc[0].setdefault(run, {}).setdefault(altloc, k)
-            if element not in ('H', 'D'):
-                self.first_altloc[1].setdefault(run, {}).setdefault(altloc, k)
-        self.chains.setdefault(chain, None)
-        self.names.setdefault(resname, None)
+            self.last_polymer = polymer
+            if altloc and run == self.runs[k]:
+                self.first_altloc[0].setdefault(run, {}).setdefault(altloc, k)
+                if element not in ('H', 'D'):
+                    self.first_altloc[1].setdefault(run, {}).setdefault(altloc, k)
+        self.res.append(k)
+        self.xyz.append(xyz)
+        if name == 'CA' and self.ca_list[k] is None:
+            self.ca_list[k] = xyz
+        elif name == 'O':
+            self.has_o_list[k] = True
+        side = LINK_SIDE.get(name)
+        if side is not None and polymer:
+            first_list = self.link_out if side == 0 else self.link_in
+            if first_list[k] is _NAN3:
+                first_list[k] = xyz
+                if k in self.link_more:
+                    self.link_more[k][side].append(xyz)
+            else:
+                pair = self.link_more.get(k)
+                if pair is None:
+                    pair = self.link_more[k] = (
+                        [self.link_out[k]] if self.link_out[k] is not _NAN3 else [],
+                        [self.link_in[k]] if self.link_in[k] is not _NAN3 else [],
+                    )
+                pair[side].append(xyz)
         if not occupancy:
             self.zero_occupancy += 1
         elif occupancy > self.occupancy_max:
@@ -222,6 +286,7 @@ class _Table:
             self.hydrogens += 1
         if len(self.res) >= CHUNK:
             self.flush()
+        return k
 
     def flush(self):
         if self.res:
@@ -229,7 +294,7 @@ class _Table:
             self.res_chunks.append(np.array(self.res, dtype=np.int64))
             self.xyz, self.res = [], []
 
-    def model(self, path, fmt, tags):
+    def model(self, path, fmt, tags, spans=None):
         self.flush()
         if not self.residues:
             raise InputError('%s has no atoms' % path)
@@ -239,21 +304,14 @@ class _Table:
         position = np.zeros((len(self.residues), 3))
         np.add.at(position, res_of, xyz)
         position /= counts[:, None]
-        for k, p in self.ca.items():
-            position[k] = p
-        has_ca = np.zeros(len(self.residues), dtype=bool)
-        has_ca[list(self.ca)] = True
-        ends = []
-        for side in self.links:
-            a = np.full((len(self.residues), 3), np.nan)
-            for k, points in side.items():
-                a[k] = points[0]
-            ends.append(a)
-        mainchain = has_ca & ~np.isnan(ends[0][:, 0]) & ~np.isnan(ends[1][:, 0])
-        mainchain[[k for k in range(len(self.residues)) if k not in self.has_o]] = False
-        more = {k: (self.links[0].get(k, []), self.links[1].get(k, []))
-                for k in set(self.links[0]) | set(self.links[1])
-                if len(self.links[0].get(k, ())) > 1 or len(self.links[1].get(k, ())) > 1}
+        for k, p in enumerate(self.ca_list):
+            if p is not None:
+                position[k] = p
+        has_ca = np.array([p is not None for p in self.ca_list], dtype=bool)
+        has_o = np.array(self.has_o_list, dtype=bool)
+        link_out = np.array(self.link_out, dtype=np.float64).reshape(len(self.residues), 3)
+        link_in = np.array(self.link_in, dtype=np.float64).reshape(len(self.residues), 3)
+        mainchain = has_ca & has_o & ~np.isnan(link_out[:, 0]) & ~np.isnan(link_in[:, 0])
         introducers = {}
         for found in self.first_altloc:
             for run, first in found.items():
@@ -263,10 +321,11 @@ class _Table:
                      position=position, chain_ids=list(self.chains),
                      residue_names=list(self.names), occupancy_max=self.occupancy_max,
                      zero_occupancy=self.zero_occupancy, hydrogens=self.hydrogens,
-                     run_of=np.array(self.runs, dtype=np.int64), link_out=ends[0], link_in=ends[1], link_more=more,
-                     has_ca=has_ca, mainchain=mainchain,
+                     run_of=np.array(self.runs, dtype=np.int64), link_out=link_out, link_in=link_in,
+                     link_more=self.link_more, has_ca=has_ca, mainchain=mainchain,
                      introducers={run: sorted(ks) for run, ks in introducers.items()},
-                     conformer0={run: next(iter(first)) for run, first in self.first_altloc[1].items()})
+                     conformer0={run: next(iter(first)) for run, first in self.first_altloc[1].items()},
+                     spans=spans)
 
 
 def _columns(path, tags):
@@ -336,7 +395,8 @@ def _unreadable(path, atom, missing):
 
 
 def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=False):
-    rows = cif_rows(path)
+    pos = [0, 0, not path.endswith('.gz')]
+    rows = cif_rows(path, _pos=pos)
     tags = next(rows)
     c = _columns(path, tags)
     if check:
@@ -350,36 +410,77 @@ def _read_cif(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=F
                   if not (zero_occupancy_as_one and t == 'occupancy' or missing_b_as_zero and t == 'B_iso_or_equiv')]
     t = _Table(path)
     model = None
-    run, prev = -1, None
+    run = -1
+    prev_chain = prev_label = prev_comp = None
     ilabel = tags.index('label_asym_id') if 'label_asym_id' in tags else c['chain']
+    c_model, c_chain, c_seq, c_ins, c_comp = c['model'], c['chain'], c['seq'], c['ins'], c['comp']
+    c_atom, c_elem, c_x, c_y, c_z, c_occ, c_alt = (
+        c['atom'], c['element'], c['x'], c['y'], c['z'], c['occ'], c['alt']
+    )
+    span_res, span_run, span_lbl_idx, span_start, span_end = [], [], [], [], []
+    lbl_map = {}
+    span_k = -1
+    span_r = -1
+    span_lbl = None
+    span_s = span_e = 0
     for r in rows:
-        if c['model'] is not None:
+        if c_model is not None:
             if model is None:
-                model = r[c['model']]
-            elif r[c['model']] != model:
+                model = r[c_model]
+            elif r[c_model] != model:
                 raise InputError('%s has more than one model; split them' % path)
-        chain, seq = r[c['chain']], r[c['seq']]
+        chain, seq = r[c_chain], r[c_seq]
         if chain in ('.', '?'):
             raise InputError('%s: atom %s has no chain id' % (path, ' '.join(r[:4])))
         if seq in ('.', '?'):
             raise InputError('%s: atom %s has no residue number (%s)'
-                             % (path, ' '.join(r[:4]), tags[c['seq']]))
+                             % (path, ' '.join(r[:4]), tags[c_seq]))
         if check:
             for i, _ in values:
                 if r[i] in ('.', '?'):
-                    raise _unreadable(path, '%s (residue %s %s %s)' % (' '.join(r[:4]), chain, r[c['comp']], seq),
+                    raise _unreadable(path, '%s (residue %s %s %s)' % (' '.join(r[:4]), chain, r[c_comp], seq),
                                       [(tag, r[j]) for j, tag in values if r[j] in ('.', '?')])
-        ins = r[c['ins']] if c['ins'] is not None else '?'
-        occ = r[c['occ']] if c['occ'] is not None else '?'
-        alt = r[c['alt']] if c['alt'] is not None else '.'
-        if prev is None or _starts_chain(chain, r[ilabel], prev[0], prev[1], prev[2]):
-            run += 1
-        prev = (chain, r[ilabel], r[c['comp']])
-        t.add(chain, seq, '' if ins in ('.', '?') else ins, '%3s' % r[c['comp']],
-              r[c['atom']], r[c['element']].upper() if c['element'] is not None else '',
-              (float(r[c['x']]), float(r[c['y']]), float(r[c['z']])),
-              None if occ in ('.', '?') else float(occ), run, '' if alt in ('.', '?') else alt)
-    return t.model(path, 'cif', tags)
+        ins = r[c_ins] if c_ins is not None else '?'
+        occ = r[c_occ] if c_occ is not None else '?'
+        alt = r[c_alt] if c_alt is not None else '.'
+        label = r[ilabel]
+        comp = r[c_comp]
+        if chain != prev_chain or label != prev_label:
+            if prev_chain is None or chain != prev_chain or is_polymer_residue(prev_comp):
+                run += 1
+            prev_chain, prev_label = chain, label
+        prev_comp = comp
+        k = t.add(chain, seq, '' if ins in ('.', '?') else ins, '%3s' % comp,
+                  r[c_atom], r[c_elem].upper() if c_elem is not None else '',
+                  (float(r[c_x]), float(r[c_y]), float(r[c_z])),
+                  None if occ in ('.', '?') else float(occ), run, '' if alt in ('.', '?') else alt)
+        if pos[2]:
+            r_k = t.runs[k]
+            if k != span_k or r_k != span_r or label != span_lbl:
+                if span_k >= 0:
+                    span_res.append(span_k)
+                    span_run.append(span_r)
+                    span_lbl_idx.append(lbl_map.setdefault(span_lbl, len(lbl_map)))
+                    span_start.append(span_s)
+                    span_end.append(span_e)
+                span_k, span_r, span_lbl, span_s = k, r_k, label, pos[0]
+            span_e = pos[1]
+    spans = None
+    if pos[2] and span_k >= 0:
+        span_res.append(span_k)
+        span_run.append(span_r)
+        span_lbl_idx.append(lbl_map.setdefault(span_lbl, len(lbl_map)))
+        span_start.append(span_s)
+        span_end.append(span_e)
+        spans = (
+            np.array(span_res, dtype=np.int32),
+            np.array(span_run, dtype=np.int32),
+            np.array(span_lbl_idx, dtype=np.int32),
+            np.array(span_start, dtype=np.int64),
+            np.array(span_end, dtype=np.int64),
+            list(lbl_map),
+        )
+    return t.model(path, 'cif', tags, spans=spans)
 
 
 def read_model(path, check=True, zero_occupancy_as_one=False, missing_b_as_zero=False):
@@ -411,17 +512,29 @@ def stretches(model):
     return np.cumsum(start)
 
 
-def _pdb_records(path):
+def _pdb_records(path, _pos=None):
     """ATOM, HETATM and TER lines of a PDB file; refuses a second MODEL"""
     models = 0
-    with _open(path) as f:
+    track = _pos is not None and _pos[2]
+    f_ctx = open(path, 'r', newline='') if track else _open(path)
+    offset = 0
+    with f_ctx as f:
         for line in f:
+            if track:
+                line_start = offset
+                offset += len(line)
             if line.startswith('MODEL'):
                 models += 1
                 if models > 1:
                     raise InputError('%s has more than one model; split them' % path)
             elif line.startswith(('ATOM  ', 'HETATM', 'TER')):
-                yield line.rstrip('\n')
+                if track:
+                    if not line.endswith('\n') or line.endswith('\r\n') or not line.isascii():
+                        track = _pos[2] = False
+                    else:
+                        _pos[0] = line_start
+                        _pos[1] = offset
+                yield line.rstrip('\r\n') if track else line.rstrip('\n')
 
 
 def pdb_lines(path):
@@ -450,14 +563,26 @@ def pdb_number(field):
 def _read_pdb(path, check=True):
     t = _Table(path)
     run, chain, ended = 0, None, False
-    for line in _pdb_records(path):
+    pos = [0, 0, not path.endswith('.gz')]
+    span_res, span_run, span_start, span_end = [], [], [], []
+    span_k = -1
+    span_r = -1
+    span_s = span_e = 0
+    for line in _pdb_records(path, _pos=pos):
         if line.startswith('TER'):
             ended = True  # iotbx starts a chain object after a TER
+            if pos[2] and span_k >= 0:
+                span_res.append(span_k)
+                span_run.append(span_r)
+                span_start.append(span_s)
+                span_end.append(span_e)
+                span_k = -1
             continue
         line = line.ljust(80)
-        if chain is not None and (ended or line[20:22].strip() != chain):
+        c_str = line[20:22].strip()
+        if chain is not None and (ended or c_str != chain):
             run += 1
-        chain, ended = line[20:22].strip(), False
+        chain, ended = c_str, False
         values = {}
         for column, i, j in PDB_NUMBERS:
             v = values[column] = pdb_number(line[i:j])
@@ -467,9 +592,34 @@ def _read_pdb(path, check=True):
                                                                  i + 1, j, column))
         name = line[12:16].strip()
         element = line[76:78].strip().upper() or name[:1].upper()
-        t.add(line[20:22].strip(), line[22:26], line[26], line[17:20], name, element,
-              (values['x'], values['y'], values['z']), values['occupancy'], run, line[16].strip())
-    return t.model(path, 'pdb', [])
+        k = t.add(c_str, line[22:26], line[26], line[17:20], name, element,
+                  (values['x'], values['y'], values['z']), values['occupancy'], run, line[16].strip())
+        if pos[2]:
+            r_k = t.runs[k]
+            if k != span_k or r_k != span_r:
+                if span_k >= 0:
+                    span_res.append(span_k)
+                    span_run.append(span_r)
+                    span_start.append(span_s)
+                    span_end.append(span_e)
+                span_k, span_r, span_s = k, r_k, pos[0]
+            span_e = pos[1]
+    spans = None
+    if pos[2] and span_k >= 0:
+        span_res.append(span_k)
+        span_run.append(span_r)
+        span_start.append(span_s)
+        span_end.append(span_e)
+    if pos[2] and span_res:
+        spans = (
+            np.array(span_res, dtype=np.int32),
+            np.array(span_run, dtype=np.int32),
+            None,
+            np.array(span_start, dtype=np.int64),
+            np.array(span_end, dtype=np.int64),
+            None,
+        )
+    return t.model(path, 'pdb', [], spans=spans)
 
 
 def _raise_nofile():
@@ -554,6 +704,7 @@ def _write_batch(model, member_of, paths, batch, zero_occupancy_as_one, missing_
         for b in batch:
             files.append(open(paths[b], 'w'))
         res_of = model.res_of
+        run_of = model.run_of
         if model.format == 'cif':
             head = 'data_block\nloop_\n' + ''.join('_atom_site.%s\n' % t for t in model.tags)
             for f in files:
@@ -564,51 +715,335 @@ def _write_batch(model, member_of, paths, batch, zero_occupancy_as_one, missing_
             ib = model.tags.index('B_iso_or_equiv') if missing_b_as_zero and 'B_iso_or_equiv' in model.tags \
                 else None
             cols = _columns(model.path, model.tags)
+            c_chain, c_comp = cols['chain'], cols['comp']
             ilabel = model.tags.index('label_asym_id') if 'label_asym_id' in model.tags else None
-            label_is_chain = cols['chain'] == ilabel
-            segments = [_Segments(paths[b]) for b in batch] if model.run_of is not None else None
+            label_is_chain = c_chain == ilabel
+            segments = [_Segments(paths[b]) for b in batch] if run_of is not None else None
             for i, r in enumerate(rows):
+                res_i = res_of[i]
+                bs = member_of[res_i]
+                if not bs:
+                    continue
                 if zero_occupancy_as_one and iocc is not None and \
                         (r[iocc] in ('.', '?') or float(r[iocc]) == 0):
                     r[iocc] = '1.00'
                 if ib is not None and r[ib] in ('.', '?'):
                     r[ib] = '0.00'
-                line = None if segments is not None else ' '.join(cif_value(t) for t in r) + '\n'
-                for b in member_of[res_of[i]]:
-                    if b in local:
+                base_line = None
+                run_i = int(run_of[res_i]) if segments is not None else 0
+                auth_i = r[c_chain]
+                comp_i = r[c_comp]
+                lbl_i = r[ilabel] if ilabel is not None else auth_i
+                for b in bs:
+                    loc = local.get(b)
+                    if loc is not None:
                         if segments is not None:
-                            row = list(r)
-                            if ilabel is not None:
-                                row[ilabel] = segments[local[b]].cif_label(
-                                    int(model.run_of[res_of[i]]), r[cols['chain']], r[ilabel],
-                                    r[cols['comp']], label_is_chain, True)
-                            else:
-                                segments[local[b]].cif_label(
-                                    int(model.run_of[res_of[i]]), r[cols['chain']], r[cols['chain']],
-                                    r[cols['comp']], True, False)
-                            files[local[b]].write(' '.join(cif_value(t) for t in row) + '\n')
-                        else:
-                            files[local[b]].write(line)
+                            out = segments[loc].cif_label(
+                                run_i, auth_i, lbl_i, comp_i, label_is_chain, ilabel is not None)
+                            if ilabel is not None and out != lbl_i:
+                                row = list(r)
+                                row[ilabel] = out
+                                files[loc].write(' '.join(cif_value(t) for t in row) + '\n')
+                                continue
+                        if base_line is None:
+                            base_line = ' '.join(cif_value(t) for t in r) + '\n'
+                        files[loc].write(base_line)
             for f in files:
                 f.write('#\n')
         else:
-            segments = [_Segments(paths[b]) for b in batch] if model.run_of is not None else None
+            segments = [_Segments(paths[b]) for b in batch] if run_of is not None else None
             for i, line in enumerate(pdb_lines(model.path)):
+                res_i = res_of[i]
+                bs = member_of[res_i]
+                if not bs:
+                    continue
                 if zero_occupancy_as_one:
                     if not pdb_number(line.ljust(60)[54:60]):  # blank or 0, as iotbx reads it
                         line = line.ljust(60)[:54] + '%6.2f' % 1.0 + line[60:]
-                line += '\n'
-                for b in member_of[res_of[i]]:
-                    if b in local:
-                        if segments is not None and segments[local[b]].pdb_ter(
-                                int(model.run_of[res_of[i]]), line[20:22].strip()):
-                            files[local[b]].write('TER\n')
-                        files[local[b]].write(line)
+                out_line = line + '\n'
+                run_i = int(run_of[res_i]) if segments is not None else 0
+                chain_i = line[20:22].strip() if segments is not None else ''
+                for b in bs:
+                    loc = local.get(b)
+                    if loc is not None:
+                        if segments is not None and segments[loc].pdb_ter(run_i, chain_i):
+                            files[loc].write('TER\n')
+                        files[loc].write(out_line)
             for f in files:
                 f.write('END\n')
     finally:
         for f in files:
             f.close()
+
+
+def check_segments(model, members, paths=None):
+    """
+    Verify that every block in members can keep the model's chain breaks
+    (_Segments.cif_label) without writing block files to disk.
+    """
+    if model.format != 'cif' or model.run_of is None:
+        return
+    if paths is None:
+        paths = ['block%05d.cif' % b for b in range(len(members))]
+    cols = _columns(model.path, model.tags)
+    has_label = 'label_asym_id' in model.tags
+    ilabel = model.tags.index('label_asym_id') if has_label else None
+    label_is_chain = cols['chain'] == ilabel
+    if model.spans is not None:
+        span_res, span_run, span_lbl_idx, _, _, label_table = model.spans
+        res_auth = [c for c, _ in model.residues]
+        res_comp = [n.strip() for n in model.resnames]
+        n_res = len(model.residues)
+        for b, mem in enumerate(members):
+            if len(mem) == 0:
+                continue
+            in_b = np.zeros(n_res, dtype=bool)
+            in_b[np.asarray(mem, dtype=np.int64)] = True
+            idx = np.flatnonzero(in_b[span_res])
+            if len(idx) == 0:
+                continue
+            r_sub = span_run[idx]
+            change = np.flatnonzero(r_sub[1:] != r_sub[:-1])
+            firsts = idx[np.concatenate(([0], change + 1))]
+            lasts = idx[np.concatenate((change, [len(idx) - 1]))]
+            seg = _Segments(paths[b])
+            for s_f, s_l in zip(firsts, lasts):
+                rf = int(span_res[s_f])
+                rl = int(span_res[s_l])
+                auth_f = res_auth[rf]
+                lbl_f = label_table[int(span_lbl_idx[s_f])] if has_label else auth_f
+                seg.cif_label(int(span_run[s_f]), auth_f, lbl_f, res_comp[rf], label_is_chain, has_label)
+                seg.auth = res_auth[rl]
+                seg.comp = res_comp[rl]
+        return
+    member_of = [[] for _ in model.residues]
+    for b, residues in enumerate(members):
+        for r in residues:
+            member_of[int(r)].append(b)
+    segments = [_Segments(paths[b]) for b in range(len(members))]
+    rows = cif_rows(model.path)
+    next(rows)
+    res_of = model.res_of
+    run_of = model.run_of
+    c_chain, c_comp = cols['chain'], cols['comp']
+    for i, r in enumerate(rows):
+        res_i = res_of[i]
+        bs = member_of[res_i]
+        if not bs:
+            continue
+        run_i = int(run_of[res_i])
+        auth_i = r[c_chain]
+        comp_i = r[c_comp]
+        lbl_i = r[ilabel] if has_label else auth_i
+        for b in bs:
+            segments[b].cif_label(run_i, auth_i, lbl_i, comp_i, label_is_chain, has_label)
+
+
+def model_slice(model, zero_occupancy_as_one=False, missing_b_as_zero=False):
+    """Compact specification for extracting block text in memory inside workers"""
+    auth_table = list(model.chain_ids)
+    auth_map = {c: i for i, c in enumerate(auth_table)}
+    res_auth_idx = np.array([auth_map[c] for c, _ in model.residues], dtype=np.int32)
+    comp_table = sorted({n.strip() for n in model.resnames})
+    comp_map = {c: i for i, c in enumerate(comp_table)}
+    res_comp_idx = np.array([comp_map[n.strip()] for n in model.resnames], dtype=np.int32)
+    spans = model.spans
+    return {
+        'path': model.path,
+        'format': model.format,
+        'tags': model.tags,
+        'n_residues': len(model.residues),
+        'auth_table': auth_table,
+        'res_auth_idx': res_auth_idx,
+        'comp_table': comp_table,
+        'res_comp_idx': res_comp_idx,
+        'spans': spans,
+        'res_of': model.res_of if spans is None else None,
+        'run_of': model.run_of if spans is None else None,
+        'zero_occupancy_as_one': bool(zero_occupancy_as_one),
+        'missing_b_as_zero': bool(missing_b_as_zero),
+    }
+
+
+def block_text(spec, members_b, path='<block>'):
+    """
+    Return the mmCIF or PDB text of a single block (members_b: residue indices)
+    in memory, preserving exact _Segments chain breaks and occupancy/B fills.
+    """
+    n_res = spec['n_residues']
+    in_b = np.zeros(n_res, dtype=bool)
+    if len(members_b):
+        in_b[np.asarray(members_b, dtype=np.int64)] = True
+    spans = spec['spans']
+    fmt = spec['format']
+    zero_occ = spec['zero_occupancy_as_one']
+    miss_b = spec['missing_b_as_zero']
+    if spans is not None:
+        span_res, span_run, span_lbl_idx, span_start, span_end, label_table = spans
+        auth_table, res_auth_idx = spec['auth_table'], spec['res_auth_idx']
+        comp_table, res_comp_idx = spec['comp_table'], spec['res_comp_idx']
+        idx = np.flatnonzero(in_b[span_res])
+        if fmt == 'cif':
+            tags = spec['tags']
+            head = 'data_block\nloop_\n' + ''.join('_atom_site.%s\n' % t for t in tags)
+            if len(idx) == 0:
+                return head + '#\n'
+            cols = _columns(spec['path'], tags)
+            has_label = 'label_asym_id' in tags
+            ilabel = tags.index('label_asym_id') if has_label else None
+            label_is_chain = cols['chain'] == ilabel
+            iocc = tags.index('occupancy') if 'occupancy' in tags else None
+            ib = tags.index('B_iso_or_equiv') if miss_b and 'B_iso_or_equiv' in tags else None
+            r_sub = span_run[idx]
+            change = np.flatnonzero(r_sub[1:] != r_sub[:-1])
+            run_starts = np.concatenate(([0], change + 1))
+            run_ends = np.concatenate((change + 1, [len(idx)]))
+            seg = _Segments(path)
+            chunks = [head]
+            cur_start = cur_end = -1
+            with open(spec['path'], 'r', newline='') as f:
+                for m_s, m_e in zip(run_starts, run_ends):
+                    s_f = int(idx[m_s])
+                    s_l = int(idx[m_e - 1])
+                    rf = int(span_res[s_f])
+                    rl = int(span_res[s_l])
+                    auth_f = auth_table[int(res_auth_idx[rf])]
+                    lbl_f = label_table[int(span_lbl_idx[s_f])] if has_label else auth_f
+                    out = seg.cif_label(
+                        int(span_run[s_f]), auth_f, lbl_f, comp_table[int(res_comp_idx[rf])],
+                        label_is_chain, has_label)
+                    seg.auth = auth_table[int(res_auth_idx[rl])]
+                    seg.comp = comp_table[int(res_comp_idx[rl])]
+                    for m in range(int(m_s), int(m_e)):
+                        s = int(idx[m])
+                        st, en = int(span_start[s]), int(span_end[s])
+                        lbl_s = label_table[int(span_lbl_idx[s])] if has_label else None
+                        rewrite = (zero_occ and iocc is not None) or (ib is not None) or (has_label and out != lbl_s)
+                        if not rewrite:
+                            if cur_end == st:
+                                cur_end = en
+                            else:
+                                if cur_start >= 0:
+                                    f.seek(cur_start)
+                                    chunks.append(f.read(cur_end - cur_start))
+                                cur_start, cur_end = st, en
+                        else:
+                            if cur_start >= 0:
+                                f.seek(cur_start)
+                                chunks.append(f.read(cur_end - cur_start))
+                                cur_start = cur_end = -1
+                            f.seek(st)
+                            raw = f.read(en - st)
+                            for line in raw.splitlines():
+                                row = cif_tokens(line)
+                                if zero_occ and iocc is not None and (row[iocc] in ('.', '?') or float(row[iocc]) == 0):
+                                    row[iocc] = '1.00'
+                                if ib is not None and row[ib] in ('.', '?'):
+                                    row[ib] = '0.00'
+                                if has_label:
+                                    row[ilabel] = out
+                                chunks.append(' '.join(cif_value(t) for t in row) + '\n')
+                if cur_start >= 0:
+                    f.seek(cur_start)
+                    chunks.append(f.read(cur_end - cur_start))
+            chunks.append('#\n')
+            return ''.join(chunks)
+        else:
+            if len(idx) == 0:
+                return 'END\n'
+            r_sub = span_run[idx]
+            change = np.flatnonzero(r_sub[1:] != r_sub[:-1])
+            run_starts = np.concatenate(([0], change + 1))
+            run_ends = np.concatenate((change + 1, [len(idx)]))
+            seg = _Segments(path)
+            chunks = []
+            cur_start = cur_end = -1
+            with open(spec['path'], 'r', newline='') as f:
+                for m_s, m_e in zip(run_starts, run_ends):
+                    s_f = int(idx[m_s])
+                    s_l = int(idx[m_e - 1])
+                    rf = int(span_res[s_f])
+                    rl = int(span_res[s_l])
+                    auth_f = auth_table[int(res_auth_idx[rf])]
+                    if seg.pdb_ter(int(span_run[s_f]), auth_f):
+                        if cur_start >= 0:
+                            f.seek(cur_start)
+                            chunks.append(f.read(cur_end - cur_start))
+                            cur_start = cur_end = -1
+                        chunks.append('TER\n')
+                    seg.auth = auth_table[int(res_auth_idx[rl])]
+                    for m in range(int(m_s), int(m_e)):
+                        s = int(idx[m])
+                        st, en = int(span_start[s]), int(span_end[s])
+                        if not zero_occ:
+                            if cur_end == st:
+                                cur_end = en
+                            else:
+                                if cur_start >= 0:
+                                    f.seek(cur_start)
+                                    chunks.append(f.read(cur_end - cur_start))
+                                cur_start, cur_end = st, en
+                        else:
+                            if cur_start >= 0:
+                                f.seek(cur_start)
+                                chunks.append(f.read(cur_end - cur_start))
+                                cur_start = cur_end = -1
+                            f.seek(st)
+                            raw = f.read(en - st)
+                            for line in raw.splitlines():
+                                if not pdb_number(line.ljust(60)[54:60]):
+                                    line = line.ljust(60)[:54] + '%6.2f' % 1.0 + line[60:]
+                                chunks.append(line + '\n')
+                if cur_start >= 0:
+                    f.seek(cur_start)
+                    chunks.append(f.read(cur_end - cur_start))
+            chunks.append('END\n')
+            return ''.join(chunks)
+
+    res_of = spec['res_of']
+    run_of = spec['run_of']
+    seg = _Segments(path) if run_of is not None else None
+    if fmt == 'cif':
+        tags = spec['tags']
+        chunks = ['data_block\nloop_\n' + ''.join('_atom_site.%s\n' % t for t in tags)]
+        rows = cif_rows(spec['path'])
+        next(rows)
+        iocc = tags.index('occupancy') if 'occupancy' in tags else None
+        ib = tags.index('B_iso_or_equiv') if miss_b and 'B_iso_or_equiv' in tags else None
+        cols = _columns(spec['path'], tags)
+        c_chain, c_comp = cols['chain'], cols['comp']
+        has_label = 'label_asym_id' in tags
+        ilabel = tags.index('label_asym_id') if has_label else None
+        label_is_chain = c_chain == ilabel
+        for i, r in enumerate(rows):
+            res_i = res_of[i]
+            if not in_b[res_i]:
+                continue
+            if zero_occ and iocc is not None and (r[iocc] in ('.', '?') or float(r[iocc]) == 0):
+                r[iocc] = '1.00'
+            if ib is not None and r[ib] in ('.', '?'):
+                r[ib] = '0.00'
+            if seg is not None:
+                out = seg.cif_label(int(run_of[res_i]), r[c_chain], r[ilabel] if has_label else r[c_chain],
+                                    r[c_comp], label_is_chain, has_label)
+                if has_label:
+                    r[ilabel] = out
+            chunks.append(' '.join(cif_value(t) for t in r) + '\n')
+        chunks.append('#\n')
+        return ''.join(chunks)
+    else:
+        chunks = []
+        for i, line in enumerate(pdb_lines(spec['path'])):
+            res_i = res_of[i]
+            if not in_b[res_i]:
+                continue
+            if zero_occ and not pdb_number(line.ljust(60)[54:60]):
+                line = line.ljust(60)[:54] + '%6.2f' % 1.0 + line[60:]
+            if seg is not None and seg.pdb_ter(int(run_of[res_i]), line[20:22].strip()):
+                chunks.append('TER\n')
+            chunks.append(line + '\n')
+        chunks.append('END\n')
+        return ''.join(chunks)
 
 
 def write_blocks(model, members, workdir, zero_occupancy_as_one=False, max_open=None, names=None,

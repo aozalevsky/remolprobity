@@ -24,6 +24,8 @@ import sys
 import tempfile
 import time
 
+import numpy as np
+
 from . import __version__
 from . import blocks, io, memory, result, schedule
 
@@ -201,15 +203,20 @@ def retry_margins(block_results, margin_of, base):
     return out
 
 
-def retry_tasks(again, size, path, work, shared):
+def retry_tasks(again, size, path, work, shared, members=None):
     """
     The tasks for the blocks run again ({block: margin}), one round for
     all of them, largest (size: atoms, core and margin) first. Each has its
     margin's block file (path[block]) and results store, results.m<margin>.
     """
-    return [{'block': b, 'path': path[b], 'workdir': work, 'shared': shared, 'margin': again[b],
+    out = []
+    for b in sorted(again, key=lambda b: (-size[b], b)):
+        t = {'block': b, 'path': path[b], 'workdir': work, 'shared': shared, 'margin': again[b],
              'store': os.path.join(work, 'results.m%d' % again[b])}
-            for b in sorted(again, key=lambda b: (-size[b], b))]
+        if members is not None:
+            t['members'] = members[b]
+        out.append(t)
+    return out
 
 
 def _plan_key(model, params):
@@ -378,25 +385,33 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
 
         block_dir = os.path.join(work, 'blocks')
         os.makedirs(block_dir, exist_ok=True)
-        if os.path.exists(plan_file):
-            ext = '.cif' if model.format == 'cif' else '.pdb'
-            paths = [os.path.join(block_dir, 'block%05d%s' % (b, ext)) for b in range(plan.n_blocks)]
-        else:
-            paths = io.write_blocks(model, plan.members, block_dir, a.zero_occupancy_as_one,
-                                    missing_b_as_zero=a.missing_b_as_zero)
+        ext = '.cif' if model.format == 'cif' else '.pdb'
+        paths = [os.path.join(block_dir, 'block%05d%s' % (b, ext)) for b in range(plan.n_blocks)]
+        if not os.path.exists(plan_file):
+            if model.spans is not None:
+                io.check_segments(model, plan.members, paths)
+            else:
+                paths = io.write_blocks(model, plan.members, block_dir, a.zero_occupancy_as_one,
+                                        missing_b_as_zero=a.missing_b_as_zero)
             with open(plan_file, 'w') as f:
                 json.dump({'key': key, 'blocks': plan.n_blocks, 'created': created}, f)
         shared = os.path.join(work, 'shared.pkl')
+        mslice = io.model_slice(model, a.zero_occupancy_as_one, a.missing_b_as_zero)
         with open(shared, 'wb') as f:
-            pickle.dump({'owner': {k: int(o) for k, o in zip(model.residues, plan.owner)},
+            pickle.dump({'chain_ids': mslice['auth_table'],
+                         'res_chain_idx': mslice['res_auth_idx'],
+                         'res_ids': np.array([rid for _, rid in model.residues], dtype='S'),
+                         'owner_arr': np.asarray(plan.owner, dtype=np.int32),
+                         'stretch_arr': np.asarray(io.stretches(model), dtype=np.int32),
+                         'model_slice': mslice,
                          'conversion': naming.conversion(model.chain_ids, model.residue_names),
                          'occupancy_max': 1.0 if a.zero_occupancy_as_one and not model.occupancy_max
                          else model.occupancy_max,
-                         'stretch': {k: int(v) for k, v in zip(model.residues, io.stretches(model))},
                          'tools': t, 'definitions': definitions, 'margin': a.margin, 'gpu': a.gpu,
                          'gpu_sock': gpu_srv.sock_path if gpu_srv is not None else None}, f, protocol=4)
         order = sorted(range(plan.n_blocks), key=lambda b: -sizes[b])
-        tasks = [{'block': b, 'path': paths[b], 'workdir': work, 'shared': shared} for b in order]
+        tasks = [{'block': b, 'path': paths[b], 'workdir': work, 'shared': shared,
+                  'members': plan.members[b]} for b in order]
         block_results = schedule.run_tasks(worker.run_block, tasks, nproc, timeout=a.block_timeout,
                                            store=os.path.join(work, 'results'), log=log, preload=PRELOAD,
                                            describe=describe, known=KNOWN)
@@ -427,13 +442,17 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
             if budget_gb is not None and peak > budget_gb:
                 log('warning: blocks run again with larger margins may need %.1f GB, more than the memory budget of '
                     '%.1f GB' % (peak, budget_gb))
-            # one pass over the model for all of them; each margin has its own results store
-            path = dict(zip(todo, io.write_blocks(model, [members[b] for b in todo], block_dir, a.zero_occupancy_as_one,
-                                                  names=['block%05d.m%d' % (b, again[b]) for b in todo],
-                                                  missing_b_as_zero=a.missing_b_as_zero)))
-            for br in schedule.run_tasks(worker.run_block, retry_tasks(again, size, path, work, shared), workers,
-                                         timeout=a.block_timeout, log=log, preload=PRELOAD, describe=describe,
-                                         known=KNOWN):
+            if model.spans is not None:
+                path = {b: os.path.join(block_dir, 'block%05d.m%d%s' % (b, again[b], ext)) for b in todo}
+                io.check_segments(model, [members[b] for b in todo], [path[b] for b in todo])
+            else:
+                path = dict(zip(todo, io.write_blocks(model, [members[b] for b in todo], block_dir,
+                                                      a.zero_occupancy_as_one,
+                                                      names=['block%05d.m%d' % (b, again[b]) for b in todo],
+                                                      missing_b_as_zero=a.missing_b_as_zero)))
+            for br in schedule.run_tasks(worker.run_block, retry_tasks(again, size, path, work, shared, members),
+                                         workers, timeout=a.block_timeout, log=log, preload=PRELOAD,
+                                         describe=describe, known=KNOWN):
                 block_results[at[br['block']]] = br
             retried.update(again)
         gpu_peak_gb = gpu_srv.stop() if gpu_srv is not None else 0.0
