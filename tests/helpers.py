@@ -8,16 +8,20 @@ IMAGE = os.environ.get('REMOLPROBITY_IMAGE')
 STOCK_REDUCE = os.environ.get('REMOLPROBITY_STOCK_REDUCE', '/opt/remolprobity-stock/reduce')
 
 
-def in_image(*args, check=True, env=None, timeout=None, memory_gb=None):
+def in_image(*args, check=True, env=None, timeout=None, memory_gb=None, nv=False):
     """
     mmtbx.python with args in the MolProbity image, remolprobity importable;
-    with memory_gb, in a scope the kernel kills beyond that much memory
+    with memory_gb, in a scope the kernel kills beyond that much memory;
+    with nv, passes --nv to apptainer exec for GPU access
     """
     cmd = []
     if memory_gb:
         cmd += ['systemd-run', '--user', '--scope', '--quiet', '-p', 'MemoryMax=%dG' % memory_gb,
                 '-p', 'MemorySwapMax=0']
-    cmd += ['apptainer', 'exec', '--env', 'PYTHONPATH=%s' % REPO]
+    cmd += ['apptainer', 'exec']
+    if nv:
+        cmd += ['--nv']
+    cmd += ['--env', 'PYTHONPATH=%s' % REPO]
     for key, value in (env or {}).items():
         cmd += ['--env', '%s=%s' % (key, value)]
     cmd += [IMAGE, 'mmtbx.python'] + [str(a) for a in args]

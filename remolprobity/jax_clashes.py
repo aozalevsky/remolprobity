@@ -1865,14 +1865,18 @@ def block_clashes(noh, conv, owned, core_tree, margin, tools, workdir, occupancy
     os.remove(noh_pdb)
     restore_chain_ids(withh, restore)
 
-    return score_from_withh(
-        withh,
-        names=names,
-        resnames=resnames,
-        owned=owned,
-        occupancy_max=occupancy_max,
-        use_segids=use_segids,
-        model_id=model_id,
-        core_tree=core_tree,
-        margin=margin,
-    )
+    try:
+        return score_from_withh(
+            withh,
+            names=names,
+            resnames=resnames,
+            owned=owned,
+            occupancy_max=occupancy_max,
+            use_segids=use_segids,
+            model_id=model_id,
+            core_tree=core_tree,
+            margin=margin,
+        )
+    finally:
+        if os.path.exists(withh):
+            os.remove(withh)

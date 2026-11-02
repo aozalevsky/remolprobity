@@ -67,7 +67,8 @@ proposed in cctbx/cctbx_project#1245 (see the README's Related work).
 | `blocks` | Residue positions (the residue's first CA atom, else the mean of its atoms, as `io` records them); k-d median splits to a target core size; margin residues by distance; ownership map | numpy, scipy |
 | `tools` | Locate reduce and probe; reduce self-check; versions | subprocess |
 | `worker` | One block: parse; Ramachandran per chain, rotamers; reduce and probe with the global PDB name table; requested geometry definitions; margin checks; owned results as plain data | cctbx |
-| `result` | Result schema v1; merge of block results; canonical order; totals; provenance | stdlib |
+| `jax_tables`, `jax_io`, `jax_residues`, `jax_clashes`, `jax_geometry` | Optional `--gpu` backend: reproducible `.npz` table builders and single persistent `GPUServer` process (`jax_tables`); hierarchy helpers (`jax_io`); GPU kernels for Ramachandran, rotamers, C-beta, omega and CaBLAM (`jax_residues`), probe dot-surface clashes (`jax_clashes`), and `v34`/`v33` geometry restraints (`jax_geometry`) | numpy, scipy, cctbx, jax |
+| `result` | Result schema v2; merge of block results; canonical order; totals; provenance | stdlib |
 | `run` | Plan, write blocks, schedule workers, merge, write the result; progress log; resume | the above |
 | `adapters.ihmv33`, `adapters.ihmv34` | IHMValidation caches from a result | stdlib |
 
@@ -77,7 +78,7 @@ Command line:
 mmtbx.python -m remolprobity MODEL -o RESULT [--geometry v34,v33]
     [--memory GB] [--block-atoms N] [--margin A] [--nproc N]
     [--reduce BIN] [--probe BIN] [--workdir DIR] [--keep-workdir] [--resume]
-    [--block-timeout S] [--zero-occupancy-as-one] [--missing-b-as-zero]
+    [--block-timeout S] [--zero-occupancy-as-one] [--missing-b-as-zero] [--gpu]
 mmtbx.python -m remolprobity stock MODEL -o RESULT [--workdir DIR]
 python3 -m remolprobity compare A B [--tol T] [--limit N] [--json]
 python3 -m remolprobity.adapters.ihmv33 RESULT MODEL_ID OUT.mp.pkl
@@ -126,8 +127,10 @@ takes either and restores tuples.
   and chain counts; block parameters, margin overhead and the margin of
   each block run again with a larger one (`blocks.retried`); geometry
   definitions computed; deviations from stock MolProbity (section 3);
-  options that change data (`--zero-occupancy-as-one`,
-  `--missing-b-as-zero`); wall time, peak memory.
+  options (`--zero-occupancy-as-one`, `--missing-b-as-zero`, `--gpu`); with
+  `--gpu`, `gpu` (`jax`/`jaxlib` versions, `backend`, `device`, `.npz`
+  table SHA-256s and source commits); wall time, peak memory (`main`,
+  `worker`, and `gpu_server` with `--gpu`).
 - `ramachandran`: `total`, `favored`, `allowed`, `outliers`, and every
   result `(chain, resid, resname, altloc, class, phi, psi, score)`, as
   ramalyze returns them, altloc variants included.
@@ -287,7 +290,10 @@ error, crash or timeout: the run stops and writes no result.
 ## 4. Resources
 
 - Main process: about 60 bytes per atom in numpy arrays, plus the residue
-  table (about 0.5 GB for 8M atoms).
+  table (about 0.5 GB for 8M atoms). With `--gpu`, one persistent GPU
+  server process (`GPU_SERVER_GB = 1.0`, ~0.82 GB measured RSS) holds the
+  CUDA context, static lookup tables and compiled XLA kernels across all
+  blocks, while block workers run CPU preparation without importing `jax`.
 - Worker: about 0.3 GB plus 12 KB per atom of its block, core and margin
   (restraints), plus about 0.5 KB per residue of the model for the
   ownership and stretch maps every worker loads (0.36-0.42 KB measured on

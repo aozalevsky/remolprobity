@@ -31,11 +31,14 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 
 import pytest
 
-from helpers import REPO, in_image
+from helpers import DATA, REPO, in_image
 from remolprobity import blocks, compare, io, result, run
+
+L_L10 = os.path.join(DATA, '9a1n_L_L10.cif')
 
 CORPUS_DIR = os.environ.get('REMOLPROBITY_CORPUS', os.path.expanduser('~/.cache/remolprobity/corpus'))
 ENTRIES = [e for e in json.load(open(os.path.join(REPO, 'tests', 'corpus', 'corpus.json')))
@@ -135,14 +138,49 @@ def same_image(provenance, what):
         '%s was made with other tools or cctbx: %s' % (what, {k: provenance.get(k) for k in state})
 
 
-def refused(entry, model, *args):
+def refused(entry, model, *args, nv=False):
     """Check that remolprobity refuses the model as the entry says: an error, no traceback, no result"""
-    out = results_path(entry, 'refused')
+    out = results_path(entry, 'gpu.refused' if nv else 'refused')
     r = in_image('-m', 'remolprobity', model, '-o', out, '--geometry', 'v34,v33', *args,
-                 check=False, timeout=3600, memory_gb=SCOPE_GB)
+                 check=False, timeout=3600, memory_gb=SCOPE_GB, nv=nv)
     assert r.returncode == 1, r.stderr[-4000:]
     assert entry['refused_by_both']['remolprobity'] in r.stderr and 'error:' in r.stderr, r.stderr[-4000:]
     assert 'Traceback' not in r.stderr and not os.path.exists(out), r.stderr[-4000:]
+
+
+@functools.lru_cache(maxsize=1)
+def has_gpu():
+    """Whether an NVIDIA GPU is visible on the host and inside the image with --nv"""
+    try:
+        r = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0 or 'GPU ' not in r.stdout:
+            return False
+        ri = in_image('-c', 'import jax; assert jax.default_backend() == "gpu"', check=False, timeout=60, nv=True)
+        return ri.returncode == 0
+    except Exception:
+        return False
+
+
+def ours_gpu(entry, model, size, margin=25, nproc=1):
+    """remolprobity --gpu's result in one block (size 0) or in blocks of size atoms, run unless cached"""
+    if not has_gpu():
+        pytest.skip('no GPU available in image with --nv')
+    label = 'gpu.one' if size == 0 else 'gpu.%d.%d' % (size, margin)
+    out = results_path(entry, label)
+    if not os.path.exists(out):
+        m = read(model)
+        plan = blocks.plan_blocks(m, size, margin)
+        within_budget('remolprobity --gpu %s %s with %d workers' % (entry['name'], label, nproc),
+                      run.choose_workers(plan.sizes(m), m.n_atoms, len(m.residues), nproc=nproc, gpu=True)[1])
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        args = ['--gpu', '--block-atoms', str(size)] + (['--margin', str(margin), '--nproc', str(nproc)] if size else [])
+        r = in_image('-m', 'remolprobity', model, '-o', out, '--geometry', 'v34,v33', *args,
+                     check=False, timeout=6 * 3600, memory_gb=SCOPE_GB, nv=True)
+        if r.returncode != 0:
+            raise RunError('remolprobity %s %s' % (os.path.basename(model), ' '.join(args)), r.returncode, r.stderr)
+    r = result.read(out)
+    same_image(r['provenance'], out)
+    return r
 
 
 def ours(entry, model, size, margin=25, nproc=1):
@@ -226,3 +264,50 @@ def test_oracle2_blocks_against_one_block(entry, nominal, margin, parts):
             '%d/%d' % (nominal, margin) not in entry.get('retries_at', ()):
         assert retried == {}, retried
     assert compare.differences(result.comparable(one), result.comparable(many), tol=1e-9) == []
+
+
+@pytest.mark.oracle
+@pytest.mark.parametrize('entry', ENTRIES, ids=[e['name'] for e in ENTRIES])
+def test_oracle3_gpu_against_cpu(entry):
+    if not has_gpu():
+        pytest.skip('no GPU available in image with --nv')
+    model = path(entry)
+    if entry.get('refused_by_both'):
+        refused(entry, model, '--gpu', '--block-atoms', '0', nv=True)
+        return
+    cpu_one = ours(entry, model, 0)
+    gpu_one = ours_gpu(entry, model, 0)
+    assert gpu_one['provenance']['options']['gpu'] is True
+    assert gpu_one['provenance']['gpu']['backend'] == 'gpu'
+    assert 'gpu_server' in gpu_one['provenance']['peak_gb']
+    assert compare.differences(result.comparable(cpu_one), result.comparable(gpu_one), tol=1e-6) == []
+
+    size = block_atoms(read(model).n_atoms, 20000, 2)
+    gpu_many = ours_gpu(entry, model, size, 20, NPROC)
+    assert gpu_many['provenance']['blocks']['count'] > 1
+    assert compare.differences(result.comparable(cpu_one), result.comparable(gpu_many), tol=1e-6) == []
+
+
+@pytest.mark.oracle
+def test_oracle_gpu_margin_retry_and_resume(tmp_path):
+    if not has_gpu():
+        pytest.skip('no GPU available in image with --nv')
+    cpu_one = str(tmp_path / 'cpu_one.pkl')
+    gpu_many = str(tmp_path / 'gpu_many.pkl')
+    work = str(tmp_path / 'work')
+    in_image('-m', 'remolprobity', L_L10, '-o', cpu_one, '--block-atoms', '0', '--geometry', 'v34,v33',
+             timeout=3600, memory_gb=SCOPE_GB)
+    args = ('-m', 'remolprobity', L_L10, '-o', gpu_many, '--gpu', '--block-atoms', '2500', '--margin', '15',
+            '--nproc', '4', '--geometry', 'v34,v33', '--workdir', work)
+    r1 = in_image(*args, '--keep-workdir', timeout=3600, memory_gb=SCOPE_GB, nv=True)
+    first = result.read(gpu_many)
+    retried = first['provenance']['blocks']['retried']
+    assert retried and len(retried) < first['provenance']['blocks']['count'], retried
+    assert 'running it again' in r1.stderr
+    assert compare.differences(result.comparable(result.read(cpu_one)), result.comparable(first), tol=1e-6) == []
+
+    r2 = in_image(*args, '--resume', timeout=3600, memory_gb=SCOPE_GB, nv=True)
+    assert r2.stderr.count('done before') == 2 and ' done (' not in r2.stderr, r2.stderr[-3000:]
+    again = result.read(gpu_many)
+    assert again['provenance']['blocks']['retried'] == retried
+    assert compare.differences(result.comparable(first), result.comparable(again), tol=0) == []

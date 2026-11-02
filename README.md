@@ -120,10 +120,22 @@ To apply both patches, use one of these:
     stock binaries;
   - copies this package to `/opt/remolprobity`, on `PYTHONPATH`, and runs
     it as the image's run script, so `apptainer run remolprobity.sif ...`
-    is `mmtbx.python -m remolprobity ...` (see [Usage](#usage)).
+    is `mmtbx.python -m remolprobity ...` (see [Usage](#usage));
+  - installs `jax==0.6.2`, `jaxlib==0.6.2` and `jax-cuda12-plugin==0.6.2`
+    into `/opt/molprobity/conda_base/bin/python`, and pre-builds the four
+    static lookup table archives (`jax_rotarama.npz`, `jax_cablam.npz`,
+    `jax_cdl.npz`, `jax_probe.npz`) into `/opt/remolprobity/tables`
+    (`REMOLPROBITY_TABLES_DIR`) with `scripts/build_jax_tables.py`.
 
   A base that is already patched keeps its stock reduce and its patched
   sources.
+- **GPU (`--gpu`, optional).** `--gpu` requires an NVIDIA GPU passed into
+  the container with `apptainer run --nv` (or `apptainer exec --nv`),
+  `jax[cuda12]` in `mmtbx.python`, and the four `.npz` lookup archives in
+  `REMOLPROBITY_TABLES_DIR` (`/opt/remolprobity/tables` in the layered
+  image, or `~/.cache/remolprobity`, built on demand or ahead of time with
+  `scripts/build_jax_tables.py`). If no GPU backend is active, `--gpu` stops
+  with an error rather than falling back to CPU.
 - **An existing Apptainer sandbox of MolProbity:** run
   `scripts/dev_image.sh SANDBOX`. It does the same steps in place, except
   that it does not copy the package.
@@ -142,7 +154,7 @@ to it.
 apptainer run remolprobity.sif MODEL -o RESULT [--geometry v34,v33]
     [--memory GB] [--block-atoms N] [--margin A] [--nproc N]
     [--reduce BIN] [--probe BIN] [--workdir DIR] [--keep-workdir] [--resume]
-    [--block-timeout S] [--zero-occupancy-as-one] [--missing-b-as-zero]
+    [--block-timeout S] [--zero-occupancy-as-one] [--missing-b-as-zero] [--gpu]
 ```
 
 `apptainer run` on the layered image runs `mmtbx.python -m remolprobity`,
@@ -172,6 +184,7 @@ systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 \
 | `--block-timeout S` | Turn a block that hangs into an error |
 | `--zero-occupancy-as-one` | Take an occupancy of 0, or none, as 1. Recorded in the result |
 | `--missing-b-as-zero` | Take a missing B (`.` or `?` in mmCIF) as 0. No validation here uses B. Recorded in the result |
+| `--gpu` | Evaluate residue, geometry and probe dot-surface clash checks on GPU via JAX (requires `apptainer run --nv`). Recorded in the result |
 
 ### Memory
 
@@ -203,7 +216,10 @@ bytes: systemd's `MemoryMax=16G` is 16 GiB, 17.2 GB.
 not the block size (that is `--block-atoms`). The run first plans its
 blocks, then estimates their costs:
 
-- the main process: 0.6 GB plus 60 bytes per atom of the model;
+- the main process: 0.6 GB plus 60 bytes per atom of the model (plus 1.0 GB
+  with `--gpu` for the single persistent GPU server process that holds the
+  CUDA context, static lookup tables and compiled XLA kernels across all
+  blocks);
 - each worker: 0.3 GB plus 12 KB per atom of its block, core and margin
   as planned, plus 0.5 KB per residue of the model. Every worker loads
   the whole model's ownership maps; loading them measured 0.36 to
@@ -370,10 +386,14 @@ Schema version 2:
     a larger one (`blocks.retried`, `{block: margin}`);
   - the geometry definitions computed;
   - the deviations from stock MolProbity (below);
-  - the options that change data (`--zero-occupancy-as-one`,
-    `--missing-b-as-zero`);
-  - the wall time and peak memory (`peak_gb`: the main process, and the
-    largest worker without its reduce or probe).
+  - the options (`--zero-occupancy-as-one`, `--missing-b-as-zero`, `--gpu`);
+  - with `--gpu`, `gpu`: the `jax` and `jaxlib` versions, active `backend`
+    and `device`, the SHA-256 checksums of the four `.npz` lookup tables
+    (`tables`), and their recorded `cctbx`, `chem_data` and `probe` source
+    metadata (`sources`);
+  - the wall time and peak memory (`peak_gb`: the main process, the
+    largest worker without its reduce or probe, and `gpu_server` with
+    `--gpu`).
 - `ramachandran`: `total`, `favored`, `allowed` and `outliers`, plus
   `records`. These are every result as ramalyze returns it, altloc variants
   included: `(chain, resid, resname, altloc, class, phi, psi, score)`.

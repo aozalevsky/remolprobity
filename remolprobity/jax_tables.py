@@ -82,6 +82,8 @@ _CABLAM_CACHE = None
 
 
 def _get_jax():
+    import logging
+    logging.getLogger("jax._src.xla_bridge").setLevel(logging.CRITICAL)
     try:
         import jax
         import jax.numpy as jnp
@@ -130,6 +132,8 @@ def ensure_gpu_device(require_gpu=True):
     When require_gpu is True (the default for --gpu), raises RuntimeError if no GPU
     device is available unless REMOLPROBITY_ALLOW_CPU_JAX=1 is set.
     """
+    import logging
+    logging.getLogger("jax._src.xla_bridge").setLevel(logging.CRITICAL)
     try:
         import jax
         import jaxlib

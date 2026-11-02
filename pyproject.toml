@@ -13,7 +13,7 @@ requires-python = ">=3.10"
 dependencies = ["numpy", "scipy"]
 
 [project.optional-dependencies]
-gpu = ["jax[cuda12]>=0.4", "gemmi"]
+gpu = ["jax[cuda12]==0.6.2"]
 
 [project.urls]
 Homepage = "https://github.com/aozalevsky/remolprobity"

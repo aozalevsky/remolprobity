@@ -16,8 +16,10 @@ from remolprobity import jax_tables
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--out-dir", help="directory to write .npz archives (default: ~/.cache/remolprobity)")
-    p.add_argument("--cctbx-root", help="MolProbity/cctbx root containing modules/ (default: auto-detect)")
+    p.add_argument("--out-dir", "--output-dir", dest="out_dir",
+                   help="directory to write .npz archives (default: ~/.cache/remolprobity)")
+    p.add_argument("--cctbx-root", "--molprobity-root", dest="cctbx_root",
+                   help="MolProbity/cctbx root containing modules/ (default: auto-detect)")
     args = p.parse_args(argv)
 
     out_dir = args.out_dir or jax_tables._default_tables_dir()

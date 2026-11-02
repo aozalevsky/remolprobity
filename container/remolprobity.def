@@ -47,9 +47,19 @@ From: {{ BASE }}
     apply $M/modules/probe $P/probe-hisNHcheck-quadratic.patch
     sh $P/build_reduce.sh $M/modules/reduce $M/build/reduce/exe/reduce
     sh $P/build_probe.sh $M/modules/probe $M/build/probe/exe/probe
-    $M/conda_base/bin/python -m pip install --no-cache-dir "jax[cuda12]" gemmi
+    NP_BEFORE=$($M/conda_base/bin/python -c 'import numpy, scipy; print(numpy.__version__, scipy.__version__)')
+    echo "=== pip list before ==="
+    $M/conda_base/bin/python -m pip list
+    $M/conda_base/bin/python -m pip install --no-cache-dir \
+        "jax==0.6.2" "jaxlib==0.6.2" "jax-cuda12-plugin[with_cuda]==0.6.2" "jax-cuda12-pjrt==0.6.2"
+    echo "=== pip list after ==="
+    $M/conda_base/bin/python -m pip list
+    $M/conda_base/bin/python -m pip check || true
+    NP_AFTER=$($M/conda_base/bin/python -c 'import numpy, scipy; print(numpy.__version__, scipy.__version__)')
+    echo "numpy/scipy before: $NP_BEFORE | after: $NP_AFTER"
+    [ "$NP_BEFORE" = "$NP_AFTER" ]
     PYTHONPATH=/opt/remolprobity $M/build/bin/mmtbx.python $P/build_jax_tables.py \
-        --molprobity-root "$M" --output-dir /opt/remolprobity/tables
+        --cctbx-root "$M" --out-dir /opt/remolprobity/tables
     find /opt/remolprobity -name __pycache__ -prune -exec rm -rf {} +
 
 %runscript

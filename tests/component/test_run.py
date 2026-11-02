@@ -258,8 +258,8 @@ def test_missing_b_runs_with_missing_b_as_zero_and_b_changes_nothing(tmp_path):
     remolprobity(cif, '-o', str(tmp_path / 'no_b.pkl'), '--missing-b-as-zero', '--geometry', 'v34,v33')
     remolprobity(src, '-o', str(tmp_path / 'b.pkl'), '--geometry', 'v34,v33')
     with_b, without = (result.read(str(tmp_path / n)) for n in ('b.pkl', 'no_b.pkl'))
-    assert without['provenance']['options'] == {'zero_occupancy_as_one': False, 'missing_b_as_zero': True}
-    assert with_b['provenance']['options'] == {'zero_occupancy_as_one': False, 'missing_b_as_zero': False}
+    assert without['provenance']['options'] == {'zero_occupancy_as_one': False, 'missing_b_as_zero': True, 'gpu': False}
+    assert with_b['provenance']['options'] == {'zero_occupancy_as_one': False, 'missing_b_as_zero': False, 'gpu': False}
     assert compare.differences(result.comparable(with_b), result.comparable(without), tol=0) == []
 
 
@@ -409,3 +409,39 @@ def test_a_refusal_before_the_plan_leaves_the_workdir_as_found(tmp_path):
     assert sorted(os.listdir(tmp_path)) == ['empty']  # no default workdir left beside the output
     remolprobity(p, '-o', out, '--block-atoms', '100', '--workdir', str(empty))
     assert result.read(out)['provenance']['blocks']['count'] > 1 and os.listdir(empty) == []
+
+
+@pytest.mark.container
+def test_gpu_refuses_without_gpu_and_agrees_across_retry_and_resume(tmp_path):
+    has_jax = in_image('-c', 'import jax', check=False).returncode == 0
+    if not has_jax:
+        pytest.skip('image has no jax')
+    work = tmp_path / 'work'
+    refused_out = str(tmp_path / 'refused.pkl')
+    r_no_gpu = in_image('-m', 'remolprobity', L_L10, '-o', refused_out, '--gpu', '--workdir', str(work),
+                        env={'JAX_PLATFORMS': 'cpu'}, check=False, timeout=3600)
+    assert r_no_gpu.returncode == 1 and 'requires a JAX GPU device' in r_no_gpu.stderr
+    assert 'Traceback' not in r_no_gpu.stderr and not os.path.exists(refused_out) and not work.exists()
+
+    cpu_one = str(tmp_path / 'cpu_one.pkl')
+    gpu_many = str(tmp_path / 'gpu_many.pkl')
+    remolprobity(L_L10, '-o', cpu_one, '--block-atoms', '0', '--geometry', 'v34,v33')
+    env = {'JAX_PLATFORMS': 'cpu', 'REMOLPROBITY_ALLOW_CPU_JAX': '1'}
+    args = ('-m', 'remolprobity', L_L10, '-o', gpu_many, '--gpu', '--block-atoms', '2500', '--margin', '15',
+            '--nproc', '4', '--geometry', 'v34,v33', '--workdir', str(work))
+    r1 = in_image(*args, '--keep-workdir', env=env, timeout=3600)
+    first = result.read(gpu_many)
+    retried = first['provenance']['blocks']['retried']
+    assert retried and len(retried) < first['provenance']['blocks']['count'], retried
+    assert first['provenance']['options']['gpu'] is True
+    assert set(first['provenance']['gpu']['tables']) == {
+        'rotarama_sha256', 'cablam_sha256', 'cdl_sha256', 'probe_sha256'
+    }
+    assert 'gpu_server' in first['provenance']['peak_gb']
+    assert compare.differences(result.comparable(result.read(cpu_one)), result.comparable(first), tol=1e-6) == []
+
+    r2 = in_image(*args, '--resume', env=env, timeout=3600)
+    assert r2.stderr.count('done before') == 2 and ' done (' not in r2.stderr, r2.stderr[-3000:]
+    again = result.read(gpu_many)
+    assert again['provenance']['blocks']['retried'] == retried
+    assert compare.differences(result.comparable(first), result.comparable(again), tol=0) == []
