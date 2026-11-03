@@ -13,6 +13,7 @@ Other commands:
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import pickle
@@ -173,11 +174,24 @@ def memory_summary(main_gb, blocks, at_once):
 
 
 def describe(block_result):
-    """A finished block for the log: atoms, seconds per stage, peak memory"""
+    """A finished block for the log: atoms, seconds per stage (and what built its restraints), peak memory"""
     if 'margin_needed' in block_result:
         return ': needs a margin of %d Å (ran at %g)' % (block_result['margin_needed'], block_result['margin'])
-    times = ', '.join('%s %.0fs' % kv for kv in block_result['times'].items())
-    return ': %d atoms, %s, peak %.2f GB' % (block_result['atoms'], times, block_result['peak_gb'])
+    builders = block_result.get('geometry_builders', {})
+    stages = []
+    for stage, seconds in block_result['times'].items():
+        builder = builders.get(stage[len('geometry_'):]) if stage.startswith('geometry_') else None
+        stages.append('%s %.0fs%s' % (stage, seconds, ' (%s)' % builder if builder else ''))
+    return ': %d atoms, %s, peak %.2f GB' % (block_result['atoms'], ', '.join(stages), block_result['peak_gb'])
+
+
+def builder_counts(block_results):
+    """{what built v34's restraints: blocks}; 'unknown' for a block resumed from a store that did not say"""
+    counts = {'fast': 0, 'cctbx': 0}
+    for br in block_results:
+        builder = br.get('geometry_builders', {}).get('v34', 'unknown')
+        counts[builder] = counts.get(builder, 0) + 1
+    return counts
 
 
 def retry_margins(block_results, margin_of, base):
@@ -350,14 +364,23 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
         gpu_srv = jax_tables.GPUServer(work).start()
         log('GPU server started on %s (%s)' % (gpu_srv.info['backend'], gpu_srv.info['device']))
     try:
+        # v34 restraints from the fast builder where it takes a block: always with --gpu, and in CPU
+        # runs wherever JAX is installed (as in remolprobity's image), evaluated in the workers
+        fast_v34 = 'v34' in definitions and (a.gpu or importlib.util.find_spec('jax') is not None)
+        tables = None
+        if gpu_srv is not None:
+            tables = gpu_srv.info['tables']
+        elif fast_v34:
+            from . import jax_tables
+            tables = jax_tables.table_hashes()
         hashes, commit = tool_hashes(t), cctbx_commit()
         # whatever can change a block's result: input, parameters, tools, code
         params = {'block_atoms': block_atoms, 'margin': a.margin, 'geometry': definitions,
                   'zero_occupancy_as_one': a.zero_occupancy_as_one, 'missing_b_as_zero': a.missing_b_as_zero,
                   'gpu': a.gpu, 'reduce': t.reduce, 'probe': t.probe,
                   'tools': hashes, 'cctbx': commit, 'remolprobity': __version__}
-        if gpu_srv is not None:
-            params['jax_tables'] = gpu_srv.info['tables']
+        if tables is not None:
+            params['jax_tables'] = tables
         key = _plan_key(model, params)
         plan_file = os.path.join(work, 'plan.json')
         if os.path.exists(plan_file):
@@ -406,6 +429,7 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
                          'occupancy_max': 1.0 if a.zero_occupancy_as_one and not model.occupancy_max
                          else model.occupancy_max,
                          'tools': t, 'definitions': definitions, 'margin': a.margin, 'gpu': a.gpu,
+                         'fast_v34': fast_v34,
                          'gpu_sock': gpu_srv.sock_path if gpu_srv is not None else None}, f, protocol=4)
         order = sorted(range(plan.n_blocks), key=lambda b: -sizes[b])
         tasks = [{'block': b, 'path': paths[b], 'workdir': work, 'shared': shared,
@@ -478,6 +502,8 @@ def _run_in(a, t, model, plan, sizes, nproc, budget_gb, block_atoms, definitions
     }
     if gpu_srv is not None:
         provenance['gpu'] = gpu_srv.info
+    if 'v34' in definitions:
+        provenance['v34_builder'] = {'blocks': builder_counts(block_results), 'tables': tables}
     r = result.merge(model, block_results, definitions, provenance)
     result.write(r, a.output, out=a.stdout)
     log('done in %s: clashscore %.2f, %d Ramachandran outliers, %d rotamer outliers'

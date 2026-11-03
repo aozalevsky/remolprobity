@@ -181,3 +181,18 @@ def score(definition, hierarchy, owned):
     if definition == 'v33':
         return _v33(hierarchy, owned)
     raise ValueError('unknown geometry definition %r (known: %s)' % (definition, ', '.join(DEFINITIONS)))
+
+
+def score_with_builder(definition, hierarchy, owned, fast=False):
+    """
+    score's result and what built its restraints: with fast, v34's come from
+    jax_geometry's fast builder where it takes the hierarchy ('fast'),
+    evaluated by JAX in this process; otherwise from cctbx ('cctbx'). The
+    two give the same result, about ten times faster with the fast builder.
+    """
+    if fast and definition == 'v34':
+        from . import jax_geometry
+        data = jax_geometry._extract_v34_fast(hierarchy)
+        if data is not None:
+            return jax_geometry.score_from_restraints('v34', data, owned), 'fast'
+    return score(definition, hierarchy, owned), 'cctbx'

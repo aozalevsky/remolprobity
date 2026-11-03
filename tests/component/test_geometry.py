@@ -143,6 +143,37 @@ def test_glycan_link_restraints_are_not_scored(tmp_path):
     assert out['bonds'][1] == (61 if out['scoreable'] else 65)
 
 
+BUILDERS = """
+import json, sys
+import iotbx.pdb
+from remolprobity import compare, geometry
+whole = lambda c, r: True
+out = {}
+for path in sys.argv[1:]:
+    h = iotbx.pdb.input(file_name=path).construct_hierarchy()
+    # an altloc on one residue, which the fast builder leaves to cctbx
+    alt = h.deep_copy()
+    alt.only_model().chains()[0].residue_groups()[1].atom_groups()[0].altloc = 'A'
+    for name, x in (('as is', h), ('altloc', alt)):
+        cctbx = geometry.score('v34', x.deep_copy(), whole)
+        fast, builder = geometry.score_with_builder('v34', x.deep_copy(), whole, fast=True)
+        off, builder_off = geometry.score_with_builder('v34', x.deep_copy(), whole, fast=False)
+        out['%s %s' % (path.split('/')[-1], name)] = [builder, builder_off, compare.differences(cctbx, fast),
+                                                     compare.differences(cctbx, off)]
+print(json.dumps(out))
+"""
+
+
+@pytest.mark.container
+def test_v34_takes_the_fast_builder_where_it_applies_and_matches_cctbx():
+    paths = [os.path.join(DATA, f) for f in ('1crn.pdb', '1ehz_10nt.cif', '4hhb.cif')]
+    out = json.loads(in_image('-c', BUILDERS, *paths).stdout.strip().splitlines()[-1])
+    for name, (builder, builder_off, diff, diff_off) in out.items():
+        assert builder == ('cctbx' if name.endswith('altloc') else 'fast'), name
+        assert builder_off == 'cctbx', name
+        assert diff == [] and diff_off == [], (name, diff, diff_off)
+
+
 FAST_V34_ORACLE = """
 import json, os, sys
 try:

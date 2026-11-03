@@ -136,14 +136,19 @@ To apply both patches, use one of these:
   `REMOLPROBITY_TABLES_DIR` (`/opt/remolprobity/tables` in the layered
   image, or `~/.cache/remolprobity`, built on demand or ahead of time with
   `scripts/build_jax_tables.py`). If no GPU backend is active, `--gpu` stops
-  with an error rather than falling back to CPU. With `--gpu`, `v34` bond
-  and angle restraints are built directly from the GeoStd monomer library
-  and CDL tables without constructing `mmtbx.model.manager`, falling back
-  to cctbx's `mmtbx.model.manager` (`pdb_interpretation`) on any block with
-  alternate conformations (altlocs), explicit hydrogens or deuteriums,
-  unknown or non-standard monomer definitions (including `RNAv2`
-  nucleotides such as `PSU`), unexpected atom names, or non-polymer
-  covalent or metal links within 3.0 Å.
+  with an error rather than falling back to CPU.
+- **The fast `v34` builder.** Wherever JAX is installed (the layered
+  image), with or without `--gpu`, `v34` bond and angle restraints are
+  built directly from the GeoStd monomer library and CDL tables without
+  constructing `mmtbx.model.manager`, about ten times faster and with about
+  0.5 GB less per worker; without `--gpu`, JAX evaluates them on the CPU in
+  the workers. A block falls back to cctbx's `mmtbx.model.manager`
+  (`pdb_interpretation`) if it has alternate conformations (altlocs),
+  explicit hydrogens or deuteriums, unknown or non-standard monomer
+  definitions (including `RNAv2` nucleotides such as `PSU`), unexpected
+  atom names, or a non-polymer atom within 1.95 Å of another residue. The
+  result is the same either way; `provenance.v34_builder` counts the
+  blocks each built, with the hashes of the lookup tables.
 - **An existing Apptainer sandbox of MolProbity:** run
   `scripts/dev_image.sh SANDBOX`. It does the same steps in place, except
   that it does not copy the package.

@@ -1416,7 +1416,7 @@ def extract_restraints(hierarchy, definition):
     if definition == 'v34':
         fast = _extract_v34_fast(hierarchy)
         if fast is not None:
-            return fast
+            return dict(fast, builder='fast')
     from cctbx import geometry_restraints
     from .geometry import _model
 
@@ -1544,6 +1544,7 @@ def extract_restraints(hierarchy, definition):
             'planarity_weights': p_weights,
             'planarity_origin_id': p_origin,
         })
+    out['builder'] = 'cctbx'
     return out
 
 
@@ -1866,3 +1867,9 @@ def score(definition, hierarchy, owned, restraint_data=None):
     if restraint_data is None:
         restraint_data = extract_restraints(hierarchy, definition)
     return score_from_restraints(definition, restraint_data, owned)
+
+
+def score_with_builder(definition, hierarchy, owned, fast=True):
+    """score's result and what built its restraints, 'fast' or 'cctbx' (fast: the GPU path always tries it)"""
+    data = extract_restraints(hierarchy, definition)
+    return score_from_restraints(definition, data, owned), data['builder']

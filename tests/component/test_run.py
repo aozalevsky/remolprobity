@@ -16,6 +16,17 @@ def remolprobity(*args, check=True):
 
 
 @pytest.mark.container
+def test_cpu_runs_build_v34_restraints_with_the_fast_builder_and_say_so(tmp_path):
+    out = str(tmp_path / 'r.pkl')
+    remolprobity(os.path.join(DATA, '4hhb.cif'), '-o', out, '--block-atoms', '2000', '--nproc', '4')
+    p = result.read(out)['provenance']
+    assert p['blocks']['count'] > 1
+    assert p['v34_builder']['blocks'] == {'fast': p['blocks']['count'], 'cctbx': 0}
+    # the fast builder reads the CDL table: its hash, with the others', is part of the run
+    assert set(p['v34_builder']['tables']) == {'rotarama_sha256', 'cablam_sha256', 'cdl_sha256', 'probe_sha256'}
+
+
+@pytest.mark.container
 def test_blocks_agree_with_one_block(tmp_path):
     one, many = str(tmp_path / 'one.pkl'), str(tmp_path / 'many.pkl')
     remolprobity(L_L10, '-o', one, '--block-atoms', '0', '--geometry', 'v34,v33')
@@ -444,6 +455,7 @@ def test_gpu_refuses_without_gpu_and_agrees_across_retry_and_resume(tmp_path):
         'rotarama_sha256', 'cablam_sha256', 'cdl_sha256', 'probe_sha256'
     }
     assert 'gpu_server' in first['provenance']['peak_gb']
+    assert sum(first['provenance']['v34_builder']['blocks'].values()) == first['provenance']['blocks']['count']
     assert compare.differences(result.comparable(result.read(cpu_one)), result.comparable(first), tol=1e-6) == []
 
     r2 = in_image(*args, '--resume', env=env, timeout=3600)

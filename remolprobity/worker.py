@@ -145,11 +145,14 @@ def run_block(task):
     times['clashes'] = time.time() - t
     del noh
 
-    geo = {}
+    geo, builders = {}, {}
     geo_mod = jax_geometry if use_gpu else geometry
+    fast = use_gpu or s.get('fast_v34', False)
+    if fast and not use_gpu:
+        os.environ['JAX_PLATFORMS'] = 'cpu'  # JAX in this process, never the GPU a CPU run did not ask for
     for d in s['definitions']:
         t = time.time()
-        geo[d] = geo_mod.score(d, h.deep_copy(), owned)
+        geo[d], builders[d] = geo_mod.score_with_builder(d, h.deep_copy(), owned, fast=fast)
         times['geometry_' + d] = time.time() - t
     os.rmdir(workdir)
     times['total'] = time.time() - t0
@@ -157,7 +160,7 @@ def run_block(task):
             'rotamers': rota, 'cbeta': cbeta, 'omega': omega, 'cablam': cablam, 'cablam_classes': cablam_classes,
             'clashes': clash['records'],
             'probe_atoms': clash['probe_atoms'],
-            'geometry': geo, 'times': times,
+            'geometry': geo, 'geometry_builders': builders, 'times': times,
             'peak_gb': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
             # the largest of its reduce and probe processes
             'children_peak_gb': resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1e6}

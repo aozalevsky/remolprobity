@@ -67,7 +67,7 @@ proposed in cctbx/cctbx_project#1245 (see the README's Related work).
 | `blocks` | Residue positions (the residue's first CA atom, else the mean of its atoms, as `io` records them); k-d median splits to a target core size; margin residues by distance; ownership map | numpy, scipy |
 | `tools` | Locate reduce and probe; reduce self-check; versions | subprocess |
 | `worker` | One block: materialize block text from `model_slice` (or read block file); parse; Ramachandran per chain, rotamers; reduce and probe with the global PDB name table; requested geometry definitions; margin checks; owned results as plain data | cctbx |
-| `jax_tables`, `jax_io`, `jax_residues`, `jax_clashes`, `jax_geometry` | Optional `--gpu` backend (requires the layered JAX image and `--nv`): reproducible `.npz` table builders and single persistent `GPUServer` process (`jax_tables`); hierarchy helpers (`jax_io`); GPU kernels for Ramachandran, rotamers, C-beta, omega and CaBLAM (`jax_residues`), probe dot-surface clashes (`jax_clashes`), and `v34`/`v33` geometry restraints (`jax_geometry`, including direct GeoStd + CDL `v34` proxy extraction in `_extract_v34_fast` with fallback to cctbx's `mmtbx.model.manager` on blocks with altlocs, hydrogens/deuteriums, unknown or `RNAv2` monomers, unexpected atom names, or non-polymer covalent/metal links within 3.0 Å) | numpy, scipy, cctbx, jax |
+| `jax_tables`, `jax_io`, `jax_residues`, `jax_clashes`, `jax_geometry` | Optional `--gpu` backend (requires the layered JAX image and `--nv`): reproducible `.npz` table builders and single persistent `GPUServer` process (`jax_tables`); hierarchy helpers (`jax_io`); GPU kernels for Ramachandran, rotamers, C-beta, omega and CaBLAM (`jax_residues`), probe dot-surface clashes (`jax_clashes`), and `v34`/`v33` geometry restraints (`jax_geometry`, including direct GeoStd + CDL `v34` proxy extraction in `_extract_v34_fast`, which CPU runs use too wherever JAX is installed, with fallback to cctbx's `mmtbx.model.manager` on blocks with altlocs, hydrogens/deuteriums, unknown or `RNAv2` monomers, unexpected atom names, or a non-polymer atom within 1.95 Å of another residue) | numpy, scipy, cctbx, jax |
 | `result` | Result schema v2; merge of block results; canonical order; totals; provenance | stdlib |
 | `run` | Plan, write blocks, schedule workers, merge, write the result; progress log; resume | the above |
 | `adapters.ihmv33`, `adapters.ihmv34` | IHMValidation caches from a result | stdlib |
@@ -308,11 +308,14 @@ error, crash or timeout: the run stops and writes no result.
   for the compact NumPy ownership, stretch and byte-span arrays every
   worker loads from `shared.pkl` (~48 bytes per residue); reduce about
   1.3 KB per atom and probe about 2.3 KB per atom run as subprocesses.
-  With `--gpu`, `v34` bond and angle restraints are extracted directly from
-  the GeoStd monomer library and CDL tables (`_extract_v34_fast`), avoiding
-  the ~1 GB per-worker `mmtbx.model.manager` overhead unless a block falls
-  back to cctbx (altlocs, hydrogens/deuteriums, unknown or `RNAv2`
-  monomers, unexpected atom names, or non-polymer covalent/metal links).
+  Wherever JAX is installed, with or without `--gpu`, `v34` bond and angle
+  restraints are extracted directly from the GeoStd monomer library and CDL
+  tables (`_extract_v34_fast`), avoiding the ~0.5 GB per-worker
+  `mmtbx.model.manager` overhead (1.51 against 1.02 GB on 107k-atom blocks
+  of the 9A1N 800k subset) unless a block falls back to cctbx (altlocs,
+  hydrogens/deuteriums, unknown or `RNAv2` monomers, unexpected atom names,
+  or a non-polymer atom within 1.95 Å of another residue). The estimate
+  above is cctbx's, so it holds for blocks that fall back.
 - `--memory GB` chooses the number of workers, not the block size
   (`--block-atoms`, default 130,000): after planning, the most workers
   whose largest planned blocks fit in it together with the main process,
