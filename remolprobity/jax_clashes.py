@@ -17,10 +17,12 @@ from scipy.spatial import cKDTree
 from .clashes import (
     REACH,
     MarginError,
-    _by_residue,
+    _atoms_by_residue,
     _cliques,
     _coordinates,
     check_cliques,
+    group_label,
+    moved_points,
     rename_chain_ids,
     restore_chain_ids,
     spare_chain_ids,
@@ -1770,7 +1772,7 @@ def score_from_withh(
         )
 
     xyz = _coordinates(withh_pdb)
-    by_residue = _by_residue(xyz)
+    atoms = _atoms_by_residue(xyz)
     limit = margin - REACH
 
     def farthest(points):
@@ -1791,10 +1793,10 @@ def score_from_withh(
     model_residue = {(c, residue_id(r, i)): v[:2] for (c, r, i), v in names.items()}
     check_cliques(
         _cliques(withh_pdb),
-        lambda m: by_residue.get(m, []),
+        lambda m: moved_points(atoms, m),
         core_tree,
         margin,
-        lambda m: "%s %s" % model_residue.get(m, m),
+        lambda m: group_label(m, model_residue),
     )
 
     found = probe_clashes_jax(

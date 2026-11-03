@@ -265,22 +265,22 @@ def test_missing_b_runs_with_missing_b_as_zero_and_b_changes_nothing(tmp_path):
 
 @pytest.mark.container
 def test_blocks_needing_a_larger_margin_run_again_with_it(tmp_path):
-    # at 15 Å, L/L10's reduce cliques reach past 2,500-atom blocks' margins (they ask for 18)
+    # at 11 Å, L/L10's reduce cliques reach past two 2,500-atom blocks' margins (they ask for 13)
     one, many = str(tmp_path / 'one.pkl'), str(tmp_path / 'many.pkl')
     remolprobity(L_L10, '-o', one, '--block-atoms', '0', '--geometry', 'v34,v33')
-    r = remolprobity(L_L10, '-o', many, '--block-atoms', '2500', '--margin', '15', '--nproc', '4',
+    r = remolprobity(L_L10, '-o', many, '--block-atoms', '2500', '--margin', '11', '--nproc', '4',
                      '--geometry', 'v34,v33')
     b = result.read(many)
     retried = b['provenance']['blocks']['retried']
     # some blocks, not all: a retry of every block would hide a broken check
     assert retried and len(retried) < b['provenance']['blocks']['count'], retried
-    assert all(15 < m <= 30 for m in retried.values()), retried
+    assert all(11 < m <= 22 for m in retried.values()), retried
     assert 'running it again' in r.stderr and 'GB' in r.stderr
     assert compare.differences(result.comparable(result.read(one)), result.comparable(b), tol=1e-9) == []
     # with no B at all, read as 0, the blocks that run again get it filled in too: the same result
     no_b, out = str(tmp_path / 'no_b.cif'), str(tmp_path / 'no_b.pkl')
     _cif_with_value(L_L10, no_b, 'B_iso_or_equiv', '.', every=True)
-    remolprobity(no_b, '-o', out, '--block-atoms', '2500', '--margin', '15', '--nproc', '4', '--geometry', 'v34,v33',
+    remolprobity(no_b, '-o', out, '--block-atoms', '2500', '--margin', '11', '--nproc', '4', '--geometry', 'v34,v33',
                  '--missing-b-as-zero')
     assert result.read(out)['provenance']['blocks']['retried'] == retried
     assert compare.differences(result.comparable(b), result.comparable(result.read(out)), tol=0) == []
@@ -289,7 +289,7 @@ def test_blocks_needing_a_larger_margin_run_again_with_it(tmp_path):
 @pytest.mark.container
 def test_resume_after_blocks_ran_again(tmp_path):
     work, out = str(tmp_path / 'work'), str(tmp_path / 'r.pkl')
-    args = ('-o', out, '--block-atoms', '2500', '--margin', '15', '--nproc', '4', '--workdir', work)
+    args = ('-o', out, '--block-atoms', '2500', '--margin', '11', '--nproc', '4', '--workdir', work)
     remolprobity(L_L10, *args, '--keep-workdir')
     first = result.read(out)
     assert first['provenance']['blocks']['retried']
@@ -302,14 +302,20 @@ def test_resume_after_blocks_ran_again(tmp_path):
 
 
 @pytest.mark.container
-def test_a_block_needing_more_than_twice_the_margin_stops_the_run(tmp_path):
-    # 4HHB in 300-atom blocks needs 21 Å: more than twice the minimum margin of 10
-    out = str(tmp_path / 'r.pkl')
-    r = remolprobity(os.path.join(DATA, '4hhb.cif'), '-o', out, '--block-atoms', '300', '--margin', '10',
-                     '--nproc', '8', check=False)
-    assert r.returncode == 1 and not os.path.exists(out)
-    assert 'MarginError: ' in r.stderr and 'or more' in r.stderr and 'up to twice --margin, 20 Å' in r.stderr
-    assert 'Traceback' not in r.stderr
+def test_blocks_running_again_over_several_rounds_match_one_block(tmp_path):
+    # 4HHB in 300-atom blocks at the minimum margin of 10 Å: blocks run again
+    # at 14 Å, some of them again at 17 and 18, each round showing more of the
+    # cliques the smaller margin cut off; a block asking for more than twice
+    # the margin would stop the run (tests/unit/test_run_retry.py)
+    model = os.path.join(DATA, '4hhb.cif')
+    one, many = str(tmp_path / 'one.pkl'), str(tmp_path / 'many.pkl')
+    remolprobity(model, '-o', one, '--block-atoms', '0')
+    r = remolprobity(model, '-o', many, '--block-atoms', '300', '--margin', '10', '--nproc', '8')
+    retried = result.read(many)['provenance']['blocks']['retried']
+    assert retried and max(retried.values()) > 14 and all(10 < m <= 20 for m in retried.values()), retried
+    assert 'ran at 14' in r.stderr
+    assert compare.differences(result.comparable(result.read(one)), result.comparable(result.read(many)),
+                               tol=1e-9) == []
 
 
 @pytest.mark.container
@@ -345,7 +351,7 @@ with open(noh, 'w') as f:
 withh = tools.add_hydrogens(tools.find_tools(), noh, work)
 residues = {(l[20:22].strip(), residue_id(l[22:26], l[26])) for l in open(withh) if l.startswith(('ATOM', 'HETATM'))}
 members = [x for c in clashes._cliques(withh) for x in c]
-print(json.dumps({'members': len(members), 'found': sum(tuple(x) in residues for x in members),
+print(json.dumps({'members': len(members), 'found': sum(tuple(x[:2]) in residues for x in members),
                   'above_9999': sum(int(x[1].rstrip('ABCDEFGHIJKLMNOPQRSTUVWXYZ')) > 9999 for x in members)}))
 """
 
@@ -427,7 +433,7 @@ def test_gpu_refuses_without_gpu_and_agrees_across_retry_and_resume(tmp_path):
     gpu_many = str(tmp_path / 'gpu_many.pkl')
     remolprobity(L_L10, '-o', cpu_one, '--block-atoms', '0', '--geometry', 'v34,v33')
     env = {'JAX_PLATFORMS': 'cpu', 'REMOLPROBITY_ALLOW_CPU_JAX': '1'}
-    args = ('-m', 'remolprobity', L_L10, '-o', gpu_many, '--gpu', '--block-atoms', '2500', '--margin', '15',
+    args = ('-m', 'remolprobity', L_L10, '-o', gpu_many, '--gpu', '--block-atoms', '2500', '--margin', '11',
             '--nproc', '4', '--geometry', 'v34,v33', '--workdir', str(work))
     r1 = in_image(*args, '--keep-workdir', env=env, timeout=3600)
     first = result.read(gpu_many)

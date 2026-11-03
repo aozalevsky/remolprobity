@@ -5,6 +5,7 @@ import re
 import shlex
 import string
 import subprocess
+from collections import namedtuple
 
 import numpy as np
 
@@ -19,7 +20,14 @@ REACH = 5.0  # Å: a contact's reach, for checking the margin holds a block's pa
 # residue name (3), atom name (4) and altloc (1). reduce writes the number in
 # hybrid-36 (4 characters, A000 for 10000) for groups it rotates, but in
 # decimal of any width for groups it flips (amide, His): 10742, not A0LQ.
-_GROUP = re.compile(r'(.{2})(\s*-?\d+|[A-Za-z][0-9A-Za-z]{3})(.).{8}')
+_GROUP = re.compile(r'(.{2})(\s*-?\d+|[A-Za-z][0-9A-Za-z]{3})(.)(.{3})(.{4})(.)')
+# A clique member: one group reduce moves. atom: the atom whose hydrogens it
+# rotates, or '' for a flip (amide, His); altloc '' for every conformer
+Group = namedtuple('Group', 'chain resid resname atom altloc')
+# the atoms a flip turns over, with the hydrogens reduce places on them
+FLIP_ATOMS = {'ASN': ('CG', 'OD1', 'ND2', 'HD21', 'HD22'), 'GLN': ('CD', 'OE1', 'NE2', 'HE21', 'HE22'),
+              'HIS': ('CG', 'ND1', 'CD2', 'CE1', 'NE2', 'HD1', 'HD2', 'HE1', 'HE2')}
+BONDED_H = 1.3  # Å: a hydrogen this close to a rotated group's atom is one of the group's
 
 
 class MarginError(Exception):
@@ -68,19 +76,52 @@ def _coordinates(withh):
     return found
 
 
-def _by_residue(xyz):
-    """The points of _coordinates by residue: {(chain, resid): [xyz, ...]}, in PDB chain ids"""
+def _atoms_by_residue(xyz):
+    """The atoms of _coordinates by residue: {(chain, resid): [(name, altloc, xyz), ...]}, in PDB chain ids"""
     out = {}
     for k, p in xyz.items():
-        out.setdefault((k[0], residue_id(k[1], k[2])), []).append(p)
+        out.setdefault((k[0], residue_id(k[1], k[2])), []).append((k[4], k[5], p))
     return out
+
+
+def _is_hydrogen(name):
+    return name.lstrip('0123456789')[:1] in ('H', 'D')
+
+
+def moved_points(atoms, group):
+    """
+    The points of what reduce moves in a group (a Group of _cliques): the
+    rotated atom with its hydrogens, or the atoms a flip turns over, in the
+    group's conformer (every conformer for altloc ''). The rest of the
+    residue stays where it is in every orientation reduce tries, so only
+    these points can touch a block's atoms differently. A group whose atom
+    or flip isn't found counts every atom of its residue. atoms:
+    _atoms_by_residue of the protonated block.
+    """
+    found = atoms.get((group.chain, group.resid), [])
+    mine = [a for a in found if not group.altloc or a[1] in ('', group.altloc)]
+    if group.atom:
+        centre = [p for n, _, p in mine if n == group.atom]
+        if centre:
+            return centre + [p for n, _, p in mine if _is_hydrogen(n) and n != group.atom
+                             and any(math.dist(p, c) <= BONDED_H for c in centre)]
+    elif group.resname in FLIP_ATOMS:
+        turned = [p for n, _, p in mine if n in FLIP_ATOMS[group.resname]]
+        if turned:
+            return turned
+    return [p for _, _, p in found]
+
+
+def group_label(group, model_residue):
+    """A clique member in the model's names: chain, residue and the atom reduce rotates, or 'flip'"""
+    return '%s %s %s' % (model_residue.get(group[:2], group[:2]) + (group.atom or 'flip',))
 
 
 def _cliques(withh):
     """
-    reduce's cliques, from its USER MOD Set records: lists of members
-    (chain, resid), in PDB chain ids. A record whose group has no residue
-    number where one belongs is an error, not a member skipped.
+    reduce's cliques, from its USER MOD Set records: lists of members, each
+    a Group, in PDB chain ids. A record whose group has no residue number
+    where one belongs is an error, not a member skipped.
     """
     sets = {}
     with open(withh) as f:
@@ -91,8 +132,9 @@ def _cliques(withh):
                 if group is None:
                     raise RuntimeError("reduce's record %r: no residue number where reduce writes one"
                                        % line.rstrip())
-                sets.setdefault(int(head.split('.')[0]), []).append(
-                    (group.group(1).strip(), residue_id(group.group(2), group.group(3))))
+                sets.setdefault(int(head.split('.')[0]), []).append(Group(
+                    group.group(1).strip(), residue_id(group.group(2), group.group(3)), group.group(4).strip(),
+                    group.group(5).strip(), group.group(6).strip()))
     return list(sets.values())
 
 
@@ -103,8 +145,9 @@ def check_cliques(cliques, points_of, core_tree, margin, label):
     beyond margin - REACH of it: reduce could orient it differently with
     its surroundings cut off. Of several, the one that needs the largest
     margin, so that the block runs again once. points_of(member) lists the
-    member's xyz; label(member) names it for messages. A member without
-    points is an error: its clique could not be checked.
+    xyz of what the member moves (moved_points); label(member) names it for
+    messages. A member without points is an error: its clique could not be
+    checked.
     """
     if core_tree is None:
         return
@@ -250,7 +293,7 @@ def block_clashes(noh, conv, owned, core_tree, margin, tools, workdir, occupancy
     os.remove(noh_pdb)
     restore_chain_ids(withh, restore)
     xyz = _coordinates(withh)
-    by_residue = _by_residue(xyz)
+    atoms = _atoms_by_residue(xyz)
     limit = margin - REACH
 
     def farthest(points):
@@ -273,8 +316,8 @@ def block_clashes(noh, conv, owned, core_tree, margin, tools, workdir, occupancy
     # members and atoms both as (chain, resid): reduce's members can be
     # decimal where its atoms are hybrid-36
     model_residue = {(c, residue_id(r, i)): v[:2] for (c, r, i), v in names.items()}
-    check_cliques(_cliques(withh), lambda m: by_residue.get(m, []), core_tree, margin,
-                  lambda m: '%s %s' % model_residue.get(m, m))
+    check_cliques(_cliques(withh), lambda m: moved_points(atoms, m), core_tree, margin,
+                  lambda m: group_label(m, model_residue))
 
     pcm = probe_clashscore_manager(h_pdb_string=None, fast=False, condensed_probe=True, nuclear=False,
                                    largest_occupancy=occupancy_max, use_segids=use_segids,
