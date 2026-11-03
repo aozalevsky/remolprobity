@@ -183,17 +183,20 @@ except ImportError as e:
 import numpy as np
 import iotbx.pdb
 from scitbx.array_family import flex
-from remolprobity import blocks, io, jax_geometry
+from remolprobity import blocks, geometry, io, jax_geometry
 
 data_dir = sys.argv[1]
 corpus_dir = sys.argv[2] if len(sys.argv) > 2 else ''
 targets = [(os.path.join(data_dir, f), 2000, 25.0)
-           for f in ('1crn.pdb', '1ehz_10nt.cif', '4hhb.cif', '9a1n_L_L10.cif', '9a1n_split_chain.cif')]
+           for f in ('1crn.pdb', '1ehz_10nt.cif', '4hhb.cif', '9a1n_L_L10.cif',
+                     '9a1n_split_chain.cif', '5y6p_bilin_cys.cif')]
 for cf in ('9a1n_100k.cif', '9a1n_400k.cif'):
     cpath = os.path.join(corpus_dir, cf)
     if corpus_dir and os.path.exists(cpath):
         targets.append((cpath, 20000, 20.0))
 checked_blocks = 0
+bilin_link_bonds = 0
+lone_altloc_residues = 0
 for path, block_atoms, margin in targets:
     fname = os.path.basename(path)
     m = io.read_model(path)
@@ -203,9 +206,11 @@ for path, block_atoms, margin in targets:
         txt = io.block_text(ms, mem, path='block%05d.%s' % (b, m.format))
         h1 = iotbx.pdb.input(source_info=None, lines=flex.split_lines(txt)).construct_hierarchy(sort_atoms=False)
         h2 = h1.deep_copy()
+        h3 = h1.deep_copy()
         fast = jax_geometry._extract_v34_fast(h1)
         assert fast is not None, (fname, b)
-        # Reference via mmtbx.model.manager (_model)
+        # Reference via mmtbx.model.manager (_model): all origin_ids (except
+        # split-chain inter-chain polymer link_TRANS origin_id 79 in 9a1n_split_chain.cif)
         from cctbx import geometry_restraints
         from remolprobity.geometry import _model
         from remolprobity.ids import atom_tuple
@@ -217,32 +222,61 @@ for path, block_atoms, margin in targets:
         angles = grm.angle_proxies
         assert fast['atom_tuples'] == [atom_tuple(a.fetch_labels()) for a in atoms], (fname, b)
         np.testing.assert_allclose(fast['xyz'], np.asarray(sites.as_numpy_array(), dtype=np.float64), atol=1e-12)
+        keep_oid = (lambda oid: oid != 79) if fname == '9a1n_split_chain.cif' else (lambda oid: True)
         ref_b = sorted((min(int(p.i_seqs[0]), int(p.i_seqs[1])), max(int(p.i_seqs[0]), int(p.i_seqs[1])),
                         int(p.origin_id), float(p.distance_ideal), float(p.weight))
-                       for p in bonds if int(p.origin_id) in (0, 2))
+                       for p in bonds if keep_oid(int(p.origin_id)))
         fast_b = sorted((min(int(ij[0]), int(ij[1])), max(int(ij[0]), int(ij[1])),
                          int(oid), float(id_v), float(w_v))
                         for ij, oid, id_v, w_v in zip(fast['bond_iseqs'], fast['bond_origin_id'],
                                                       fast['bond_ideal'], fast['bond_weight'])
-                        if int(oid) in (0, 2))
+                        if keep_oid(int(oid)))
         assert len(ref_b) == len(fast_b), (fname, b, len(ref_b), len(fast_b))
         for rb, fb in zip(ref_b, fast_b):
             assert rb[:3] == fb[:3], (fname, b, rb, fb)
             assert abs(rb[3] - fb[3]) < 1e-10 and abs(rb[4] - fb[4]) < 1e-8, (fname, b, rb, fb)
         ref_a = sorted((min(int(p.i_seqs[0]), int(p.i_seqs[2])), int(p.i_seqs[1]), max(int(p.i_seqs[0]), int(p.i_seqs[2])),
                         int(p.origin_id), float(p.angle_ideal), float(p.weight))
-                       for p in angles if int(p.origin_id) in (0, 2))
+                       for p in angles if keep_oid(int(p.origin_id)))
         fast_a = sorted((min(int(ijk[0]), int(ijk[2])), int(ijk[1]), max(int(ijk[0]), int(ijk[2])),
                          int(oid), float(id_v), float(w_v))
                         for ijk, oid, id_v, w_v in zip(fast['angle_iseqs'], fast['angle_origin_id'],
                                                        fast['angle_ideal'], fast['angle_weight'])
-                        if int(oid) in (0, 2))
+                        if keep_oid(int(oid)))
         assert len(ref_a) == len(fast_a), (fname, b, len(ref_a), len(fast_a))
         for ra, fa in zip(ref_a, fast_a):
             assert ra[:4] == fa[:4], (fname, b, ra, fa)
             assert abs(ra[4] - fa[4]) < 1e-10 and abs(ra[5] - fa[5]) < 1e-8, (fname, b, ra, fa)
+        # Also compare v34 totals, outliers, and per-residue RMSZ on data_dir fixtures
+        if block_atoms == 2000:
+            owned_set = {m.residues[int(r)] for r in np.flatnonzero(plan.owner == b)}
+            owned_fn = lambda c, r, s=owned_set: (c, r) in s
+            sc_fast = jax_geometry.score_from_restraints('v34', fast, owned_fn)
+            sc_ref = geometry.score('v34', h3, owned_fn)
+            for kind in ('bonds', 'angles'):
+                assert sc_fast[kind]['total'] == sc_ref[kind]['total'], (fname, b, kind)
+                fo = sorted(sc_fast[kind]['outliers'])
+                ro = sorted(sc_ref[kind]['outliers'])
+                assert len(fo) == len(ro), (fname, b, kind, len(fo), len(ro))
+                for x, y in zip(fo, ro):
+                    assert x[:-4] == y[:-4] and all(abs(u - v) < 1e-6 for u, v in zip(x[-4:], y[-4:])), (fname, b, kind, x, y)
+            assert set(sc_fast['residues'].keys()) == set(sc_ref['residues'].keys()), (fname, b)
+            for rk in sc_ref['residues']:
+                fv = sc_fast['residues'][rk]
+                rv = sc_ref['residues'][rk]
+                assert fv[0] == rv[0] and fv[2] == rv[2], (fname, b, rk, fv, rv)
+                assert abs(fv[1] - rv[1]) < 1e-6 and abs(fv[3] - rv[3]) < 1e-6, (fname, b, rk, fv, rv)
+            if fname == '5y6p_bilin_cys.cif':
+                bilin_link_bonds += sum(1 for rb in ref_b if rb[2] == 10)
+                for rk in (('NG', '158'), ('IR', '7')):
+                    if rk in sc_fast['residues']:
+                        lone_altloc_residues += 1
         checked_blocks += 1
-print(json.dumps({'checked_blocks': checked_blocks}))
+assert bilin_link_bonds >= 3, bilin_link_bonds
+assert lone_altloc_residues == 2, lone_altloc_residues
+print(json.dumps({'checked_blocks': checked_blocks,
+                  'bilin_link_bonds': bilin_link_bonds,
+                  'lone_altloc_residues': lone_altloc_residues}))
 """
 
 CORPUS_DIR = os.environ.get('REMOLPROBITY_CORPUS', os.path.expanduser('~/.cache/remolprobity/corpus'))
@@ -254,4 +288,6 @@ def test_fast_v34_proxy_arrays_match_cctbx_across_blocks():
     if 'skip' in out:
         pytest.skip('jax not available in image: %s' % out['skip'])
     assert out['checked_blocks'] >= 10
+    assert out['bilin_link_bonds'] >= 3
+    assert out['lone_altloc_residues'] == 2
 

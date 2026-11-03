@@ -1073,14 +1073,17 @@ def _extract_v34_fast(hierarchy):
     """
     Fast in-memory extraction of v34 bond and angle restraints (monomer library
     templates, peptide/RNA/DNA polymer links, disulfide bonds, and GPU CDL updates)
-    without running full mmtbx.model.manager / pdb_interpretation.
-    Returns None if the block contains altlocs, hydrogens, unknown monomers,
-    ambiguous modified nucleotides, or non-polymer covalent links, falling back
-    to _model(hierarchy, 'v34').
+    without running full-block mmtbx.model.manager / pdb_interpretation.
+    When non-polymer ligands have close inter-residue contacts, builds a small
+    cctbx sub-model holding the flagged ligands, their contact partners, and
+    sequence neighbors, and merges the ligand link restraints into the fast arrays.
+    Returns None if the block contains multi-conformer altlocs, hydrogens, unknown
+    monomers, or ambiguous modified nucleotides, falling back to _model(hierarchy, 'v34').
     """
     from iotbx.pdb.rna_dna_detection import residue_analysis
     import mmtbx.geometry_restraints.torsion_restraints.utils as torsion_utils
     from mmtbx.monomer_library.rna_sugar_pucker_analysis import evaluate as rna_evaluate
+    from scitbx.array_family import flex
     from scipy.spatial import cKDTree
 
     h = hierarchy.deep_copy()
@@ -1091,6 +1094,7 @@ def _extract_v34_fast(hierarchy):
     n_atoms = atoms.size()
     if n_atoms == 0:
         return None
+    atom_el = []
     for a in atoms:
         e = a.element.strip().upper()
         if e:
@@ -1100,6 +1104,7 @@ def _extract_v34_fast(hierarchy):
             nm = a.name.strip().lstrip('0123456789')
             if nm[:1] in ('H', 'D') and a.parent().resname.strip() != nm:
                 return None
+        atom_el.append(e)
 
     srv, rna_params, interp_params = _get_mon_lib()
     peptide_break_sq = 3.0 ** 2
@@ -1113,6 +1118,11 @@ def _extract_v34_fast(hierarchy):
     cys_sg_atoms = []
     nonpoly_cov_xyz = []
     nonpoly_cov_res = []
+    nonpoly_cov_el = []
+    nonpoly_met_xyz = []
+    nonpoly_met_res = []
+    rgs_list = []
+    chain_rgs = []
     all_res_idx = np.full(n_atoms, -1, dtype=np.int32)
     cur_res_id = 0
 
@@ -1144,19 +1154,28 @@ def _extract_v34_fast(hierarchy):
         rgs = list(chain.residue_groups())
         n_rgs = len(rgs)
         rg_infos = []
+        c_res_ids = []
+        chain_altlocs = set()
         for rg in rgs:
             ags = rg.atom_groups()
-            if len(ags) != 1 or ags[0].altloc.strip() != '':
+            if len(ags) == 0:
                 return None
+            if len(ags) != 1 or ags[0].altloc.strip() != '':
+                resnames = {ag.resname.strip() for ag in ags}
+                altlocs = {ag.altloc.strip() for ag in ags if ag.altloc.strip() != ''}
+                chain_altlocs.update(altlocs)
+                if len(resnames) != 1 or len(altlocs) > 1 or len(chain_altlocs) > 1:
+                    return None
             ag = ags[0]
             resname = ag.resname.strip()
+            rg_atoms = rg.atoms()
             t_entry = _get_comp_template(resname)
             if t_entry is None:
                 return None
             comp, _, _, _ = t_entry
             is_pep = comp.is_peptide()
             if not is_pep:
-                ra1 = residue_analysis(residue_atoms=ag.atoms(), distance_tolerance=rna_params.bond_detection_distance_tolerance)
+                ra1 = residue_analysis(residue_atoms=rg_atoms, distance_tolerance=rna_params.bond_detection_distance_tolerance)
                 is_na = (ra1.problems is None) or comp.is_rna_dna()
                 if is_na and (ra1.problems is not None or comp.classification not in ('RNA', 'DNA')):
                     return None
@@ -1164,30 +1183,39 @@ def _extract_v34_fast(hierarchy):
                 ra1 = None
                 is_na = False
             if is_na:
-                amap = {_norm_na_atom(a.name): a for a in ag.atoms()}
+                amap = {_norm_na_atom(a.name): a for a in rg_atoms}
             else:
-                amap = {a.name.strip(): a for a in ag.atoms()}
-            for a in ag.atoms():
+                amap = {a.name.strip(): a for a in rg_atoms}
+            if len(amap) != rg_atoms.size():
+                return None
+            for a in rg_atoms:
                 all_res_idx[a.i_seq] = cur_res_id
             if not is_pep and not is_na and resname not in _NON_COVALENT_SOLVENT_IONS:
-                for a in ag.atoms():
-                    el = a.element.strip().upper()
+                for a in rg_atoms:
+                    el = atom_el[a.i_seq]
                     if el in ('C', 'N', 'O', 'P', 'S', 'B', 'SE'):
                         nonpoly_cov_xyz.append(a.xyz)
                         nonpoly_cov_res.append(cur_res_id)
+                        nonpoly_cov_el.append(el)
+                    elif el not in ('H', 'D', 'F', 'CL', 'BR', 'I'):
+                        nonpoly_met_xyz.append(a.xyz)
+                        nonpoly_met_res.append(cur_res_id)
+            rgs_list.append(rg)
+            c_res_ids.append(cur_res_id)
             cur_res_id += 1
             rg_infos.append((rg, ag, resname, comp, is_pep, is_na, ra1, amap))
+        chain_rgs.append(c_res_ids)
 
         na_is_2p = [False] * n_rgs
         na_pucker_mod = [None] * n_rgs
         for idx_rg, (rg, ag, resname, comp, is_pep, is_na, ra1, amap) in enumerate(rg_infos):
             if is_na and ra1 is not None and ra1.is_rna:
-                next_pdb_res = rg_infos[idx_rg + 1][1] if idx_rg + 1 < n_rgs else None
+                next_amap = rg_infos[idx_rg + 1][7] if idx_rg + 1 < n_rgs else None
                 ana = rna_evaluate(
                     params=rna_params,
                     residue_1_deoxy_ribo_atom_dict=ra1.deoxy_ribo_atom_dict,
                     residue_1_c1p_outbound_atom=ra1.c1p_outbound_atom,
-                    residue_2_p_atom=next_pdb_res.get_atom('P') if next_pdb_res is not None else None,
+                    residue_2_p_atom=next_amap.get('P') if next_amap is not None else None,
                 )
                 is_2p = bool(ana is not None and ana.is_2p)
                 na_is_2p[idx_rg] = is_2p
@@ -1304,16 +1332,90 @@ def _extract_v34_fast(hierarchy):
     sites = atoms.extract_xyz()
     xyz = np.asarray(sites.as_numpy_array(), dtype=np.float64)
     is_h = np.zeros(n_atoms, dtype=bool)
+    atom_tuples = [atom_tuple(a.fetch_labels()) for a in atoms]
 
-    if nonpoly_cov_xyz:
+    if nonpoly_cov_xyz or nonpoly_met_xyz:
         tree_all = cKDTree(xyz)
-        np_xyz = np.asarray(nonpoly_cov_xyz, dtype=np.float64)
-        hits = tree_all.query_ball_point(np_xyz, 1.95)
-        for q_idx, nbrs in enumerate(hits):
-            r_q = nonpoly_cov_res[q_idx]
-            for j in nbrs:
-                if all_res_idx[j] != r_q:
-                    return None
+        flagged_ligs = set()
+        partner_res = set()
+        if nonpoly_cov_xyz:
+            np_xyz = np.asarray(nonpoly_cov_xyz, dtype=np.float64)
+            hits = tree_all.query_ball_point(np_xyz, 2.50)
+            for q_idx, nbrs in enumerate(hits):
+                r_q = nonpoly_cov_res[q_idx]
+                el_q = nonpoly_cov_el[q_idx]
+                q_pos = np_xyz[q_idx]
+                for j in nbrs:
+                    r_j = int(all_res_idx[j])
+                    if r_j != r_q:
+                        if el_q in ('P', 'S', 'SE') or atom_el[j] in ('P', 'S', 'SE'):
+                            flagged_ligs.add(r_q)
+                            partner_res.add(r_j)
+                        else:
+                            d2 = float(np.sum((q_pos - xyz[j]) ** 2))
+                            if d2 <= 2.22 ** 2:
+                                flagged_ligs.add(r_q)
+                                partner_res.add(r_j)
+        if nonpoly_met_xyz:
+            met_xyz = np.asarray(nonpoly_met_xyz, dtype=np.float64)
+            hits_met = tree_all.query_ball_point(met_xyz, 3.05)
+            for q_idx, nbrs in enumerate(hits_met):
+                r_q = nonpoly_met_res[q_idx]
+                for j in nbrs:
+                    r_j = int(all_res_idx[j])
+                    if r_j != r_q:
+                        flagged_ligs.add(r_q)
+                        partner_res.add(r_j)
+
+        if flagged_ligs:
+            from cctbx import geometry_restraints
+            from .geometry import _model
+
+            sub_res = set(flagged_ligs) | set(partner_res)
+            res_to_chain_pos = {}
+            for c_idx, c_list in enumerate(chain_rgs):
+                for pos, r_id in enumerate(c_list):
+                    res_to_chain_pos[r_id] = (c_idx, pos)
+            for r_j in list(partner_res):
+                c_idx, pos = res_to_chain_pos[r_j]
+                c_list = chain_rgs[c_idx]
+                if pos > 0:
+                    sub_res.add(c_list[pos - 1])
+                if pos + 1 < len(c_list):
+                    sub_res.add(c_list[pos + 1])
+
+            h_tuple_to_iseq = {t: idx for idx, t in enumerate(atom_tuples)}
+            keep = flex.bool(n_atoms, False)
+            for r_id in sorted(sub_res):
+                for a in rgs_list[r_id].atoms():
+                    keep[a.i_seq] = True
+            sub_h = h.select(keep, copy_atoms=True)
+            sub_m = _model(sub_h, 'v34')
+            h.atoms().reset_i_seq()
+            sub_atoms = sub_m.get_hierarchy().atoms()
+            sub_to_h = [h_tuple_to_iseq[atom_tuple(a.fetch_labels())] for a in sub_atoms]
+            sub_sites = sub_atoms.extract_xyz()
+            sub_grm = sub_m.get_restraints_manager().geometry
+            sub_bonds = sub_grm.pair_proxies(
+                sites_cart=sub_sites,
+                flags=geometry_restraints.flags.flags(bond=True),
+            ).bond_proxies.simple
+            for p in sub_bonds:
+                i0 = sub_to_h[int(p.i_seqs[0])]
+                i1 = sub_to_h[int(p.i_seqs[1])]
+                r0 = int(all_res_idx[i0])
+                r1 = int(all_res_idx[i1])
+                if r0 != r1 and (r0 in flagged_ligs or r1 in flagged_ligs):
+                    add_bond(i0, i1, float(p.distance_ideal), float(p.weight), int(p.origin_id))
+            for p in sub_grm.angle_proxies:
+                i0 = sub_to_h[int(p.i_seqs[0])]
+                i1 = sub_to_h[int(p.i_seqs[1])]
+                i2 = sub_to_h[int(p.i_seqs[2])]
+                r0 = int(all_res_idx[i0])
+                r1 = int(all_res_idx[i1])
+                r2 = int(all_res_idx[i2])
+                if not (r0 == r1 == r2) and (r0 in flagged_ligs or r1 in flagged_ligs or r2 in flagged_ligs):
+                    add_angle(i0, i1, i2, float(p.angle_ideal), float(p.weight), int(p.origin_id))
 
     if len(cys_sg_atoms) >= 2:
         sg_xyz = xyz[[x[0] for x in cys_sg_atoms]]
@@ -1391,7 +1493,6 @@ def _extract_v34_fast(hierarchy):
         angle_origin_id=angle_origin_id,
     )
 
-    atom_tuples = [atom_tuple(a.fetch_labels()) for a in atoms]
     return {
         'xyz': xyz,
         'is_h': is_h,
