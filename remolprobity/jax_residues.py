@@ -401,7 +401,6 @@ def _ensure_flat_index(h):
     smeta = _get_static_meta()
     def_to_idx = smeta["def_to_idx"]
     aa_to_idx = smeta["aa_to_idx"]
-    common_aa = smeta["common_aa"]
     all_aa = smeta["all_aa"]
     all_na = smeta["all_na"]
     d_aa = smeta["d_aa"]
@@ -534,10 +533,8 @@ def _ensure_flat_index(h):
                 else:
                     cb_rt = 0
 
-                if rn_u in common_aa:
-                    cab_t = 1 if rn_u == "GLY" else (2 if rn_u == "PRO" else 0)
-                else:
-                    cab_t = -1
+                # cablam's contour_category: GLY, PRO, and every other name general (UNK, MSE, ...)
+                cab_t = 1 if rn_u == "GLY" else (2 if rn_u == "PRO" else 0)
 
                 cab_rn = d_to_l.get(rn_u, rn_u) if rn_u else None
                 not_hoh = int(cab_rn != "HOH")
@@ -1608,7 +1605,6 @@ def cablam(hierarchy, owned):
     chains_flat = flat["chains"] if flat is not None else {}
 
     cab_tables = get_cpu_cablam_tables()
-    common_aa = cab_tables["common_aa"]
     all_aa = cab_tables["all_aa"]
     all_na = cab_tables["all_na"]
     d_to_l = cab_tables["d_to_l"]
@@ -1951,7 +1947,7 @@ def cablam(hierarchy, owned):
                     r["ca_geom_score"] = None
                     cw_owned.append(r)
                     rn_up = r["resname"].strip().upper()
-                    if rn_up in common_aa and r["mu_in"] is not None and r["mu_out"] is not None:
+                    if r["mu_in"] is not None and r["mu_out"] is not None:
                         if r["nu"] is not None or r["ca_virt"] is not None:
                             if rn_up == "GLY":
                                 t_i = 1

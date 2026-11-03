@@ -111,3 +111,65 @@ def test_cablam_as_stock(tmp_path, split):
     if split:
         # cablamalyze keeps the second chain object of chain A only, the one after the TER (residues 24-46)
         assert int(out['first'][0][1]) >= 24, out
+
+
+# 4HHB with residues stock's CaBLAM scores on its 'general' contours though they are not common amino acids:
+# UNK in chain A (a chain without altlocs) and in chain C, MET as MSE in chain C, and in chain C one residue
+# with altlocs A and B, so that chain C takes the GPU code's path for chains with altlocs
+GPU_CABLAM = """
+import json, sys
+import iotbx.pdb
+from remolprobity import residues
+try:
+    from remolprobity import jax_residues
+except ImportError as e:
+    print(json.dumps({'skip': repr(e)})); sys.exit(0)
+h = iotbx.pdb.input(file_name=sys.argv[1]).construct_hierarchy()
+for chain in h.models()[0].chains():
+    for rg in chain.residue_groups():
+        n = int(rg.resseq)
+        for ag in rg.atom_groups():
+            if (chain.id.strip() == 'A' and 10 <= n <= 20) or (chain.id.strip() == 'C' and 50 <= n <= 55):
+                ag.resname = 'UNK'
+            elif chain.id.strip() == 'C' and ag.resname == 'MET':
+                ag.resname = 'MSE'
+                for a in ag.atoms():
+                    if a.name.strip() == 'SD':
+                        a.name, a.element = 'SE  ', 'SE'
+lines = []
+for line in h.as_pdb_string().splitlines(True):
+    if line.startswith('ATOM') and line[21] == 'C' and int(line[22:26]) == 40 and line[12:16].strip() not in ('N', 'CA', 'C', 'O'):
+        for alt, dx in (('A', 0.0), ('B', 0.4)):
+            lines.append(line[:16] + alt + line[17:30] + '%8.3f' % (float(line[30:38]) + dx) + line[38:54] + '  0.50' + line[60:])
+        continue
+    lines.append(line)
+h = iotbx.pdb.input(source_info=None, lines=''.join(lines)).construct_hierarchy()
+
+
+def fresh():
+    x = h.deep_copy()
+    x.atoms().reset_i_seq()
+    return x
+
+
+own = lambda c, r: True
+print(json.dumps({'cpu': residues.cablam(fresh(), own), 'gpu': jax_residues.cablam(fresh(), own)}))
+"""
+
+
+@pytest.mark.container
+def test_gpu_cablam_scores_residues_outside_the_common_amino_acids():
+    out = json.loads(in_image('-c', GPU_CABLAM, os.path.join(DATA, '4hhb.cif'),
+                              env={'JAX_PLATFORMS': 'cpu', 'REMOLPROBITY_ALLOW_CPU_JAX': '1'}).stdout.strip().splitlines()[-1])
+    if 'skip' in out:
+        pytest.skip('jax not available in image: %s' % out['skip'])
+    cpu, gpu = out['cpu'], out['gpu']
+    assert cpu[1] == gpu[1]
+    scored = {tuple(r[:3]) for r in cpu[0] if r[4] is not None}
+    # stock scores them: the test would pass vacuously otherwise
+    assert {('A', '15', 'UNK'), ('C', '52', 'UNK'), ('C', '32', 'MSE')} <= scored, sorted(scored)[:20]
+    assert len(cpu[0]) == len(gpu[0])
+    for c, g in zip(cpu[0], gpu[0]):
+        assert c[:4] == g[:4]
+        for u, v in zip(c[4:], g[4:]):
+            assert (u is None) == (v is None) and (u is None or abs(u - v) < 1e-9), (c, g)
