@@ -1376,6 +1376,36 @@ def _examine_dots_batch_kernel(
     return pair_has_hb, pair_min_bo_gap
 
 
+def _neighbour_matrix(dir_nb, b_starts, b_counts, b_pad, k_pad):
+    """
+    The neighbours of a batch's sources, a row each: `dir_nb[start:start + count]`,
+    padded with atom 0, and a mask of the real ones
+    """
+    nb_mat = np.zeros((b_pad, k_pad), dtype=np.int32)
+    nb_val = np.zeros((b_pad, k_pad), dtype=bool)
+    rows = np.repeat(np.arange(len(b_counts)), b_counts)
+    first = np.cumsum(b_counts) - b_counts
+    cols = np.arange(int(np.sum(b_counts))) - np.repeat(first, b_counts)
+    nb_mat[rows, cols] = dir_nb[np.repeat(b_starts, b_counts) + cols]
+    nb_val[rows, cols] = True
+    return nb_mat, nb_val
+
+
+@lazy_jit()
+def _gather_batch(per_atom, src, nb):
+    """
+    The rows of the atoms' arrays that `_examine_dots_batch_kernel` takes, in its
+    order: of the sources `src` (B,), and of their neighbours `nb` (B, K)
+    """
+    xyz, rad, cov, elem, is_h, res_id, props, flags, occ, alt_blank, h_allow, hv_bit, dot_idx = per_atom
+    return (
+        (xyz[src], rad[src], cov[src], elem[src], is_h[src], res_id[src], props[src], occ[src],
+         alt_blank[src], h_allow[src], hv_bit[src], dot_idx[src]),
+        (xyz[nb], rad[nb], cov[nb], elem[nb], is_h[nb], res_id[nb], props[nb], flags[nb], occ[nb],
+         alt_blank[nb], h_allow[nb], hv_bit[nb]),
+    )
+
+
 @register_gpu_op("probe_dots")
 def _gpu_probe_dots(
     xyz,
@@ -1417,6 +1447,14 @@ def _gpu_probe_dots(
     src_d_counts = dot_counts[dot_idx[unique_src]]
     tier_limits = (320, 656, 1216)
 
+    # The atoms go to the GPU once, and each batch's sources and neighbours are
+    # gathered there, in one call: gathering on the host and copying some 25
+    # arrays per batch took most of the time
+    per_atom = tuple(
+        jnp.asarray(a)
+        for a in (xyz, rad, cov, elem, is_h, res_id, props, flags, occ, alt_blank, h_allow, hv_bit, dot_idx)
+    )
+
     hb_s_list, hb_t_list = [], []
     bo_s_list, bo_t_list, bo_g_list = [], [], []
 
@@ -1441,40 +1479,13 @@ def _gpu_probe_dots(
             b_starts = tier_starts[b_start:b_end]
             b_counts = tier_counts[b_start:b_end]
 
-            nb_mat = np.zeros((b_pad, k_pad), dtype=np.int32)
-            nb_val = np.zeros((b_pad, k_pad), dtype=bool)
-            for r_i in range(b_len):
-                c_i = b_counts[r_i]
-                s_i = b_starts[r_i]
-                nb_mat[r_i, :c_i] = dir_nb[s_i : s_i + c_i]
-                nb_val[r_i, :c_i] = True
+            nb_mat, nb_val = _neighbour_matrix(dir_nb, b_starts, b_counts, b_pad, k_pad)
+            src, nbs = _gather_batch(per_atom, jnp.asarray(b_src), jnp.asarray(nb_mat))
 
             pair_hb, pair_bo_gap = _examine_dots_batch_kernel(
-                jnp.asarray(xyz[b_src]),
-                jnp.asarray(rad[b_src]),
-                jnp.asarray(cov[b_src]),
-                jnp.asarray(elem[b_src]),
-                jnp.asarray(is_h[b_src]),
-                jnp.asarray(res_id[b_src]),
-                jnp.asarray(props[b_src]),
-                jnp.asarray(occ[b_src]),
-                jnp.asarray(alt_blank[b_src]),
-                jnp.asarray(h_allow[b_src]),
-                jnp.asarray(hv_bit[b_src]),
-                jnp.asarray(dot_idx[b_src]),
+                *src,
                 jnp.asarray(nb_val),
-                jnp.asarray(xyz[nb_mat]),
-                jnp.asarray(rad[nb_mat]),
-                jnp.asarray(cov[nb_mat]),
-                jnp.asarray(elem[nb_mat]),
-                jnp.asarray(is_h[nb_mat]),
-                jnp.asarray(res_id[nb_mat]),
-                jnp.asarray(props[nb_mat]),
-                jnp.asarray(flags[nb_mat]),
-                jnp.asarray(occ[nb_mat]),
-                jnp.asarray(alt_blank[nb_mat]),
-                jnp.asarray(h_allow[nb_mat]),
-                jnp.asarray(hv_bit[nb_mat]),
+                *nbs,
                 dot_vecs_tbl,
                 exp_vecs_tbl,
                 dot_mask_tbl,
