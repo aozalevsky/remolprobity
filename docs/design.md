@@ -300,9 +300,12 @@ error, crash or timeout: the run stops and writes no result.
 
 - Main process: about 60 bytes per atom in numpy arrays, plus the residue
   table (about 0.5 GB for 8M atoms). With `--gpu`, one persistent GPU
-  server process (`GPU_SERVER_GB = 1.0`, ~0.82 GB measured RSS) holds the
-  CUDA context, static lookup tables and compiled XLA kernels across all
-  blocks, while block workers run CPU preparation without importing `jax`.
+  server process (`GPU_SERVER_GB = 2.0`; 1.7 GB measured RSS on 8WQL, 2.0 GB
+  on 5Y6P) holds the CUDA context, static lookup tables and compiled XLA
+  kernels across all blocks, while block workers run CPU preparation without
+  importing `jax`. It runs `GPU_SERVER_THREADS` (2) of the workers' requests
+  at once, in threads, so that one block's work on the host overlaps
+  another's on the GPU; `REMOLPROBITY_GPU_THREADS` overrides it.
 - Worker: about 0.3 GB plus 12 KB per atom of its block, core and margin
   (restraints), plus about 0.0625 KB (62.5 bytes) per residue of the model
   for the compact NumPy ownership, stretch and byte-span arrays every

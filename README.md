@@ -229,10 +229,11 @@ bytes: systemd's `MemoryMax=16G` is 16 GiB, 17.2 GB.
 not the block size (that is `--block-atoms`). The run first plans its
 blocks, then estimates their costs:
 
-- the main process: 0.6 GB plus 60 bytes per atom of the model (plus 1.0 GB
+- the main process: 0.6 GB plus 60 bytes per atom of the model (plus 2.0 GB
   with `--gpu` for the single persistent GPU server process that holds the
   CUDA context, static lookup tables and compiled XLA kernels across all
-  blocks);
+  blocks, and runs two of the workers' requests at once, or
+  `REMOLPROBITY_GPU_THREADS`);
 - each worker: 0.3 GB plus 12 KB per atom of its block, core and margin
   as planned, plus 0.0625 KB (62.5 bytes) per residue of the model. Every
   worker loads the whole model's ownership and stretch arrays from

@@ -239,28 +239,8 @@ def _gpu_server_main(sock_path, startup_conn, require_gpu):
             pass
         return
 
-    import resource
-    import traceback
     try:
-        while True:
-            conn = listener.accept()
-            try:
-                req = conn.recv()
-                if req is None or req[0] == "shutdown":
-                    peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
-                    conn.send(("ok", {"peak_gb": peak_gb}))
-                    conn.close()
-                    break
-                op_name, args = req
-                res = _GPU_OPS[op_name](*args)
-                conn.send(("ok", res))
-            except BaseException:
-                try:
-                    conn.send(("error", traceback.format_exc()))
-                except Exception:
-                    pass
-            finally:
-                conn.close()
+        _serve(listener, int(os.environ.get("REMOLPROBITY_GPU_THREADS", GPU_SERVER_THREADS)))
     finally:
         listener.close()
         try:
@@ -268,6 +248,57 @@ def _gpu_server_main(sock_path, startup_conn, require_gpu):
                 os.remove(sock_path)
         except OSError:
             pass
+
+
+# Requests the GPU server runs at once. On 8WQL and 5Y6P (8 and 13 workers,
+# one L40) 2 took the clash stage from 21-68 s per block to 19-41 s, and 4
+# gained little more for 1.5-1.7 times the GPU memory
+GPU_SERVER_THREADS = 2
+
+
+def _serve(listener, threads):
+    """
+    Answer the GPU ops asked for on `listener`, `threads` at a time, until a
+    shutdown request, which waits for those running and gets the server's peak
+    memory in GB. Threads let one block's work on the host overlap another's on
+    the GPU: JAX takes calls from several threads, and runs on the GPU without
+    the GIL.
+    """
+    import resource
+    import traceback
+    from concurrent.futures import ThreadPoolExecutor
+
+    def reply_error(conn):
+        try:
+            conn.send(("error", traceback.format_exc()))
+        except Exception:
+            pass
+
+    def answer(conn, op_name, args):
+        try:
+            conn.send(("ok", _GPU_OPS[op_name](*args)))
+        except BaseException:
+            reply_error(conn)
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="remolprobity_gpu") as pool:
+        while True:
+            conn = listener.accept()
+            try:
+                req = conn.recv()
+                if req is None or req[0] == "shutdown":
+                    pool.shutdown(wait=True)
+                    peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+                    conn.send(("ok", {"peak_gb": peak_gb}))
+                    conn.close()
+                    return
+                op_name, args = req
+            except BaseException:
+                reply_error(conn)
+                conn.close()
+                continue
+            pool.submit(answer, conn, op_name, args)
 
 
 class GPUServer:

@@ -78,3 +78,109 @@ def test_gpu_server_rpc_roundtrip(tmp_path, monkeypatch):
         finally:
             jax_tables.set_gpu_sock(None)
     assert srv.peak_gb > 0.0
+
+
+@pytest.fixture
+def sock_path(tmp_path):
+    """A socket path in tmp_path, or in /tmp if that is too long for AF_UNIX, as GPUServer does"""
+    import shutil
+    import tempfile
+
+    sock = str(tmp_path / "gpu.sock")
+    if len(sock) <= 95:
+        yield sock
+        return
+    short = tempfile.mkdtemp(prefix="rmp_test_", dir="/tmp")
+    try:
+        yield os.path.join(short, "gpu.sock")
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+
+
+def _serving(sock, threads, ops, monkeypatch):
+    """`jax_tables._serve` on the socket sock, in a thread, with `ops` as its GPU ops"""
+    import threading
+    from multiprocessing.connection import Listener
+
+    monkeypatch.setattr(jax_tables, "_GPU_OPS", dict(ops))
+    listener = Listener(sock, family="AF_UNIX", backlog=64)
+    server = threading.Thread(target=jax_tables._serve, args=(listener, threads), daemon=True)
+    server.start()
+    monkeypatch.setattr(jax_tables, "_GPU_SOCK", sock)
+    return sock, server, listener
+
+
+def _shutdown(sock):
+    from multiprocessing.connection import Client
+
+    with Client(sock, family="AF_UNIX") as conn:
+        conn.send(("shutdown", ()))
+        return conn.recv()
+
+
+def test_gpu_server_runs_requests_at_once(sock_path, monkeypatch):
+    # Two requests that each wait for the other: they finish only if the
+    # server runs them at the same time
+    import threading
+
+    met = threading.Barrier(2, timeout=10)
+
+    def meet(x):
+        met.wait()
+        return x * 2
+
+    sock, server, listener = _serving(sock_path, 2, {"meet": meet}, monkeypatch)
+    results = {}
+    clients = [threading.Thread(target=lambda i=i: results.__setitem__(i, jax_tables.call_gpu("meet", i)))
+               for i in (1, 2)]
+    for c in clients:
+        c.start()
+    for c in clients:
+        c.join(20)
+    assert results == {1: 2, 2: 4}
+    status, payload = _shutdown(sock)
+    assert status == "ok" and payload["peak_gb"] > 0.0
+    server.join(10)
+    assert not server.is_alive()
+    listener.close()
+
+
+def test_gpu_server_error_is_the_requests(sock_path, monkeypatch):
+    # A failing op is reported to its caller; the server goes on answering
+    def fail():
+        raise ValueError("no such block")
+
+    sock, server, listener = _serving(sock_path, 2, {"fail": fail, "one": lambda: 1}, monkeypatch)
+    with pytest.raises(RuntimeError, match="no such block"):
+        jax_tables.call_gpu("fail")
+    with pytest.raises(RuntimeError, match="KeyError"):
+        jax_tables.call_gpu("missing")
+    assert jax_tables.call_gpu("one") == 1
+    assert _shutdown(sock)[0] == "ok"
+    server.join(10)
+    listener.close()
+
+
+def test_gpu_server_shutdown_waits_for_running_requests(sock_path, monkeypatch):
+    import threading
+    import time
+
+    started, done = threading.Event(), []
+
+    def slow():
+        started.set()
+        time.sleep(0.5)
+        done.append(True)
+        return "slow"
+
+    sock, server, listener = _serving(sock_path, 2, {"slow": slow}, monkeypatch)
+    out = {}
+    client = threading.Thread(target=lambda: out.__setitem__("r", jax_tables.call_gpu("slow")))
+    client.start()
+    assert started.wait(10)
+    assert _shutdown(sock)[0] == "ok"
+    assert done == [True]
+    client.join(10)
+    assert out == {"r": "slow"}
+    server.join(10)
+    listener.close()

@@ -36,8 +36,9 @@ WORKER_BASE_GB, WORKER_GB_PER_ATOM = 0.3, 12e-6
 WORKER_GB_PER_MODEL_RESIDUE = 0.0625e-6
 MAIN_BASE_GB, MAIN_GB_PER_ATOM = 0.6, 6e-8
 # When --gpu is enabled, a single persistent GPU server process holds the
-# CUDA context, compiled XLA kernels and static tables (~0.82 GB RSS)
-GPU_SERVER_GB = 1.0
+# CUDA context, compiled XLA kernels and static tables, and the requests it
+# runs at once: 1.7 GB RSS on 8WQL and 2.0 GB on 5Y6P, with 2 at once
+GPU_SERVER_GB = 2.0
 # a worker's problems with the data, reported by their message (the traceback kept in the workdir)
 KNOWN = (io.InputError,)
 PRELOAD = ('iotbx.pdb', 'mmtbx.model', 'mmtbx.validation.ramalyze', 'mmtbx.validation.rotalyze',
