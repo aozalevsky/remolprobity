@@ -151,10 +151,16 @@ whole = lambda c, r: True
 out = {}
 for path in sys.argv[1:]:
     h = iotbx.pdb.input(file_name=path).construct_hierarchy()
-    # an altloc on one residue, which the fast builder leaves to cctbx
-    alt = h.deep_copy()
-    alt.only_model().chains()[0].residue_groups()[1].atom_groups()[0].altloc = 'A'
-    for name, x in (('as is', h), ('altloc', alt)):
+    # one residue's only conformer labelled A, which the fast builder takes;
+    # and that residue in two conformers, A and B, which it leaves to cctbx
+    lone = h.deep_copy()
+    lone.only_model().chains()[0].residue_groups()[1].atom_groups()[0].altloc = 'A'
+    two = lone.deep_copy()
+    rg = two.only_model().chains()[0].residue_groups()[1]
+    b = rg.atom_groups()[0].detached_copy()
+    b.altloc = 'B'
+    rg.append_atom_group(b)
+    for name, x in (('as is', h), ('lone altloc', lone), ('two altlocs', two)):
         cctbx = geometry.score('v34', x.deep_copy(), whole)
         fast, builder = geometry.score_with_builder('v34', x.deep_copy(), whole, fast=True)
         off, builder_off = geometry.score_with_builder('v34', x.deep_copy(), whole, fast=False)
@@ -169,7 +175,7 @@ def test_v34_takes_the_fast_builder_where_it_applies_and_matches_cctbx():
     paths = [os.path.join(DATA, f) for f in ('1crn.pdb', '1ehz_10nt.cif', '4hhb.cif')]
     out = json.loads(in_image('-c', BUILDERS, *paths).stdout.strip().splitlines()[-1])
     for name, (builder, builder_off, diff, diff_off) in out.items():
-        assert builder == ('cctbx' if name.endswith('altloc') else 'fast'), name
+        assert builder == ('cctbx' if name.endswith('two altlocs') else 'fast'), name
         assert builder_off == 'cctbx', name
         assert diff == [] and diff_off == [], (name, diff, diff_off)
 
