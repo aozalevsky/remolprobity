@@ -297,7 +297,7 @@ def test_oracle_gpu_margin_retry_and_resume(tmp_path):
     work = str(tmp_path / 'work')
     in_image('-m', 'remolprobity', L_L10, '-o', cpu_one, '--block-atoms', '0', '--geometry', 'v34,v33',
              timeout=3600, memory_gb=SCOPE_GB)
-    args = ('-m', 'remolprobity', L_L10, '-o', gpu_many, '--gpu', '--block-atoms', '2500', '--margin', '15',
+    args = ('-m', 'remolprobity', L_L10, '-o', gpu_many, '--gpu', '--block-atoms', '2500', '--margin', '11',
             '--nproc', '4', '--geometry', 'v34,v33', '--workdir', work)
     r1 = in_image(*args, '--keep-workdir', timeout=3600, memory_gb=SCOPE_GB, nv=True)
     first = result.read(gpu_many)
