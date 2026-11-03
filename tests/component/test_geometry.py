@@ -272,7 +272,7 @@ for path, block_atoms, margin in targets:
                     if rk in sc_fast['residues']:
                         lone_altloc_residues += 1
         checked_blocks += 1
-assert bilin_link_bonds >= 3, bilin_link_bonds
+assert bilin_link_bonds >= 4, bilin_link_bonds
 assert lone_altloc_residues == 2, lone_altloc_residues
 print(json.dumps({'checked_blocks': checked_blocks,
                   'bilin_link_bonds': bilin_link_bonds,
@@ -288,6 +288,6 @@ def test_fast_v34_proxy_arrays_match_cctbx_across_blocks():
     if 'skip' in out:
         pytest.skip('jax not available in image: %s' % out['skip'])
     assert out['checked_blocks'] >= 10
-    assert out['bilin_link_bonds'] >= 3
+    assert out['bilin_link_bonds'] >= 4
     assert out['lone_altloc_residues'] == 2
 

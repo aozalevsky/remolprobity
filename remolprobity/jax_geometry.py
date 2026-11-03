@@ -1339,8 +1339,11 @@ def _extract_v34_fast(hierarchy):
         flagged_ligs = set()
         partner_res = set()
         if nonpoly_cov_xyz:
+            # cctbx default automatic linking cutoffs: inter_residue_bond_cutoff = 2.2,
+            # buffer_for_second_row_elements = 0.5 (up to 2.7 Å when P/S/Se is involved),
+            # ligand_bond_cutoff = 1.99, carbohydrate_bond_cutoff = 1.99.
             np_xyz = np.asarray(nonpoly_cov_xyz, dtype=np.float64)
-            hits = tree_all.query_ball_point(np_xyz, 2.50)
+            hits = tree_all.query_ball_point(np_xyz, 2.72)
             for q_idx, nbrs in enumerate(hits):
                 r_q = nonpoly_cov_res[q_idx]
                 el_q = nonpoly_cov_el[q_idx]
