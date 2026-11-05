@@ -5,7 +5,8 @@
 # remolprobity package at /opt/remolprobity on PYTHONPATH. MolProbity itself
 # is not rebuilt: BASE must hold its sources under /opt/molprobity (from
 # bootstrap.py --builder=molprobity), and gcc, g++ and patch on the PATH.
-# The same steps as scripts/dev_image.sh.
+# The same steps as scripts/dev_image.sh, which also keeps what this image
+# removes from BASE because no run uses it.
 #
 # Build from the repository root (%files paths are relative to it), with
 # TMPDIR on a disk with room for BASE (not a RAM-backed /tmp):
@@ -60,6 +61,28 @@ From: {{ BASE }}
     [ "$NP_BEFORE" = "$NP_AFTER" ]
     PYTHONPATH=/opt/remolprobity $M/build/bin/mmtbx.python $P/build_jax_tables.py \
         --cctbx-root "$M" --out-dir /opt/remolprobity/tables
+    # What no run uses (traced runs, conda's dependencies, the libraries
+    # each file links): MolProbity's GUI and build packages, the NCCL and
+    # NVSHMEM wheels (JAX runs on one GPU without them), the miniconda that
+    # made conda_base, and the git histories. remolprobity reads cctbx's and
+    # MolProbity's HEAD for its provenance and log, so those two keep one
+    # commit; only the tables above read the other checkouts.
+    gui=$(for p in pyside2 qt-main qt-webengine wxpython wxwidgets libllvm21 libllvm22 \
+                   libclang-cpp22.1 libclang13 scons mesalib; do
+        ls $M/conda_base/conda-meta/$p-[0-9]*.json >/dev/null 2>&1 && echo $p || true
+    done)
+    [ -z "$gui" ] || $M/mc3/bin/conda remove -p $M/conda_base --force --offline -y -q $gui
+    $M/conda_base/bin/python -m pip uninstall -y nvidia-nccl-cu12 nvidia-nvshmem-cu12
+    for r in modules/cctbx_project molprobity; do
+        [ -d $M/$r/.git ] && [ ! -f $M/$r/.git/shallow ] || continue
+        git clone -q --depth 1 --no-checkout file://$M/$r $M/$r.shallow
+        rm -rf $M/$r/.git
+        mv $M/$r.shallow/.git $M/$r/.git
+        rmdir $M/$r.shallow
+        git -C $M/$r read-tree HEAD
+    done
+    find $M/modules -name .git ! -path $M/modules/cctbx_project/.git -prune -exec rm -rf {} +
+    rm -rf $M/mc3 $M/Miniconda3-latest-Linux-x86_64.sh
     find /opt/remolprobity -name __pycache__ -prune -exec rm -rf {} +
 
 %runscript

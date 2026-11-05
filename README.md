@@ -125,7 +125,11 @@ To apply both patches, use one of these:
     into `/opt/molprobity/conda_base/bin/python`, and pre-builds the four
     static lookup table archives (`jax_rotarama.npz`, `jax_cablam.npz`,
     `jax_cdl.npz`, `jax_probe.npz`) into `/opt/remolprobity/tables`
-    (`REMOLPROBITY_TABLES_DIR`) with `scripts/build_jax_tables.py`.
+    (`REMOLPROBITY_TABLES_DIR`) with `scripts/build_jax_tables.py`;
+  - removes what no run uses: MolProbity's GUI and build packages (Qt, wx,
+    LLVM, clang, SCons, Mesa), the NCCL and NVSHMEM wheels, the miniconda
+    that made `conda_base`, and the git histories. cctbx's and MolProbity's
+    checkouts keep their last commit, which remolprobity reports.
 
   A base that is already patched keeps its stock reduce and its patched
   sources.
