@@ -12,7 +12,7 @@ SMALL = os.path.join(DATA, '1ehz_10nt.cif')
 # the versions the log names; the provenance, which what the log adds leaves as it was
 VERSIONS = r'MolProbity \S+ \([0-9a-f]{12}\), cctbx \S+, reduce \S+, probe \S+'
 PROVENANCE = {'blocks', 'cctbx', 'deviations', 'geometry', 'input', 'options', 'peak_gb', 'probe', 'reduce',
-              'reduce_self_check', 'remolprobity', 'tools', 'wall_seconds'}
+              'reduce_self_check', 'remolprobity', 'tools', 'v34_builder', 'wall_seconds'}
 STOCK_PROVENANCE = {'cctbx', 'clashscore', 'input', 'stock', 'tools', 'wall_seconds'}
 
 
