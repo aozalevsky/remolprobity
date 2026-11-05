@@ -27,12 +27,16 @@ From: {{ BASE }}
     scripts/build_reduce.sh /opt/remolprobity-patches/build_reduce.sh
     scripts/build_probe.sh /opt/remolprobity-patches/build_probe.sh
     scripts/build_jax_tables.py /opt/remolprobity-patches/build_jax_tables.py
-    remolprobity /opt/remolprobity/remolprobity
+    remolprobity /opt/remolprobity-patches/remolprobity
 
 %post
     set -e
     M=/opt/molprobity
     P=/opt/remolprobity-patches
+    # the package replaces a BASE's copy: %files would copy it into that one
+    rm -rf /opt/remolprobity/remolprobity
+    mkdir -p /opt/remolprobity
+    mv $P/remolprobity /opt/remolprobity/remolprobity
     # a BASE already patched (scripts/dev_image.sh) keeps its stock reduce
     # and its patched sources
     apply() {
